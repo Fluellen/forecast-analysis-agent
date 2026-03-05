@@ -1,0 +1,30 @@
+{
+  "name": "forecast-analysis-agent",
+  "version": "1.0.0",
+  "description": "Autonomous AI agent that analyzes weekly forecast data for CINV articles and generates statistical insights and reports.",
+  "author": "Marcell Méri",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "python run_agent.py --cinv 1001",
+    "demo": "python run_agent.py",
+    "evaluate": "python evaluation/run_evaluation.py",
+    "format": "prettier --write \"**/*.{json,md,yml}\"",
+    "lint": "echo \"Python linting handled by flake8/ruff\""
+  },
+  "keywords": [
+    "ai-agent",
+    "forecasting",
+    "demand-planning",
+    "langgraph",
+    "llmops",
+    "data-analysis"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "prettier": "^3.2.5"
+  }
+}
