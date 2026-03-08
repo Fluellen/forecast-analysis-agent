@@ -38,6 +38,10 @@ pip-delete-this-directory.txt
 
 # Unit test / coverage reports
 *.txt
+
+# Heroku deployment manifests must be committed even though output/*.txt stays ignored.
+!requirements.txt
+!runtime.txt
 htmlcov/
 .tox/
 .nox/
