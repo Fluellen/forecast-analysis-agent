@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import websockets
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from starlette.websockets import WebSocketState
 
 import forecast_agent.config as cfg
 from forecast_agent.agent import ForecastAnalysisAgent
@@ -25,6 +27,7 @@ from forecast_agent.data_access import load_forecast_frame, load_metadata_frame
 from forecast_agent.events import run_error
 
 _streamlit_process: subprocess.Popen[str] | None = None
+logger = logging.getLogger(__name__)
 
 
 def _start_streamlit() -> None:
@@ -134,8 +137,32 @@ async def proxy_to_streamlit(path: str, request: Request) -> Response:
         return HTMLResponse("<h2>Streamlit is starting up. Refresh in a few seconds.</h2>", status_code=503)
 
     excluded = {"content-encoding", "transfer-encoding", "connection", "keep-alive"}
-    headers = {key: value for key, value in upstream.headers.items() if key.lower() not in excluded}
-    return Response(content=upstream.content, status_code=upstream.status_code, headers=headers)
+    response = Response(content=upstream.content, status_code=upstream.status_code)
+    for key, value in upstream.headers.multi_items():
+        if key.lower() not in excluded:
+            response.headers.append(key, value)
+    return response
+
+
+def _websocket_upstream_headers(websocket: WebSocket) -> dict[str, str]:
+    forwarded_headers = {
+        "cookie",
+        "origin",
+        "user-agent",
+        "accept-language",
+        "cache-control",
+        "pragma",
+    }
+    return {
+        key: value
+        for key, value in websocket.headers.items()
+        if key.lower() in forwarded_headers
+    }
+
+
+def _requested_subprotocols(websocket: WebSocket) -> list[str]:
+    raw_value = websocket.headers.get("sec-websocket-protocol", "")
+    return [value.strip() for value in raw_value.split(",") if value.strip()]
 
 
 @app.websocket("/{path:path}")
@@ -145,9 +172,15 @@ async def websocket_proxy(websocket: WebSocket, path: str) -> None:
     if query:
         upstream_url = f"{upstream_url}?{query}"
 
-    await websocket.accept()
     try:
-        async with websockets.connect(upstream_url) as upstream:
+        async with websockets.connect(
+            upstream_url,
+            additional_headers=_websocket_upstream_headers(websocket),
+            subprotocols=_requested_subprotocols(websocket) or None,
+            max_size=None,
+        ) as upstream:
+            await websocket.accept(subprotocol=upstream.subprotocol)
+
             async def client_to_upstream() -> None:
                 while True:
                     message = await websocket.receive()
@@ -167,11 +200,25 @@ async def websocket_proxy(websocket: WebSocket, path: str) -> None:
                     else:
                         await websocket.send_bytes(bytes(message))
 
-            await asyncio.gather(client_to_upstream(), upstream_to_client())
+            client_task = asyncio.create_task(client_to_upstream())
+            upstream_task = asyncio.create_task(upstream_to_client())
+            done, pending = await asyncio.wait(
+                {client_task, upstream_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in pending:
+                task.cancel()
+
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                task.result()
     except WebSocketDisconnect:
         return
     except Exception:
-        await websocket.close()
+        logger.exception("Streamlit websocket proxy failed for path %s", path)
+        if websocket.application_state != WebSocketState.DISCONNECTED:
+            await websocket.close(code=1011)
 
 
 if __name__ == "__main__":
