@@ -376,9 +376,9 @@ def _normalize_search_query(query: str) -> tuple[str, dict[str, Any]]:
 def search_article_characteristics(query: str) -> str:
     """Search the web for demand drivers, seasonality, and supply-chain characteristics for an article."""
     normalized_query, rewrite_info = _normalize_search_query(query)
-    weather_sensitivity = _assess_weather_sensitivity(query, rewrite_info, "", [])
 
     if not config.TAVILY_API_KEY:
+        weather_sensitivity = _assess_weather_sensitivity(query, rewrite_info, "", [])
         return json.dumps(
             {
                 "query": normalized_query,
@@ -395,6 +395,7 @@ def search_article_characteristics(query: str) -> str:
 
     result, error = _run_tavily_search(normalized_query, max_results=5)
     if error:
+        weather_sensitivity = _assess_weather_sensitivity(query, rewrite_info, "", [])
         return json.dumps(
             {
                 "query": normalized_query,

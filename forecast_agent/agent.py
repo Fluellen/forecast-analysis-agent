@@ -12,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from azure.identity import DefaultAzureCredential
 from jinja2 import Template
 from rich.console import Console
 
@@ -175,45 +174,9 @@ class ForecastAnalysisAgent:
         self.last_state: dict[str, Any] | None = None
 
     def _build_client(self) -> AzureOpenAIResponsesClient | OpenAIResponsesClient:
-        if self._client is not None:
-            return self._client
-
-        azure_openai_base_url = _normalize_openai_base_url(config.AZURE_OPENAI_ENDPOINT)
-        if azure_openai_base_url and config.AZURE_OPENAI_API_KEY and config.AZURE_OPENAI_MODEL_ID:
-            self._client = OpenAIResponsesClient(
-                base_url=azure_openai_base_url,
-                api_key=config.AZURE_OPENAI_API_KEY,
-                model_id=config.AZURE_OPENAI_MODEL_ID,
-            )
-            return self._client
-
-        if config.OPENAI_BASE_URL and config.OPENAI_API_KEY and config.OPENAI_RESPONSES_MODEL_ID:
-            self._client = OpenAIResponsesClient(
-                base_url=_normalize_openai_base_url(config.OPENAI_BASE_URL),
-                api_key=config.OPENAI_API_KEY,
-                model_id=config.OPENAI_RESPONSES_MODEL_ID,
-            )
-            return self._client
-
-        if config.AZURE_AI_PROJECT_ENDPOINT and config.AZURE_OPENAI_MODEL_ID:
-            self._client = AzureOpenAIResponsesClient(
-                project_endpoint=config.AZURE_AI_PROJECT_ENDPOINT,
-                deployment_name=config.AZURE_OPENAI_MODEL_ID,
-                credential=DefaultAzureCredential(exclude_interactive_browser_credential=False),
-            )
-            return self._client
-
-        if config.OPENAI_API_KEY and config.OPENAI_RESPONSES_MODEL_ID:
-            self._client = OpenAIResponsesClient(
-                api_key=config.OPENAI_API_KEY,
-                model_id=config.OPENAI_RESPONSES_MODEL_ID,
-            )
-            return self._client
-
-        raise RuntimeError(
-            "No supported model configuration is available. Configure Azure AI project variables, Azure OpenAI API key "
-            "variables, or direct OpenAI responses variables."
-        )
+        if self._client is None:
+            self._client = config.build_responses_client()
+        return self._client
 
     def _build_agent(self):
         if self._agent is None:
@@ -416,13 +379,6 @@ class ForecastAnalysisAgent:
             yield run_error(run_id, str(exc), code=type(exc).__name__)
         finally:
             runtime.reset_weather_forced(token)
-
-
-def _normalize_openai_base_url(base_url: str) -> str:
-    base_url = (base_url or "").strip().strip('"').strip("'")
-    if not base_url:
-        return ""
-    return base_url if base_url.endswith("/") else f"{base_url}/"
 
 
 def _split_deliverables(text: str) -> tuple[str, str]:

@@ -42,6 +42,60 @@ DUBLIN_TIMEZONE = "Europe/London"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 
+def normalize_openai_base_url(base_url: str) -> str:
+    """Normalize an OpenAI-compatible base URL to end with a single trailing slash."""
+    base_url = (base_url or "").strip().strip('"').strip("'")
+    if not base_url:
+        return ""
+    return base_url if base_url.endswith("/") else f"{base_url}/"
+
+
+def build_responses_client():
+    """Build a responses-capable chat client from the active environment configuration.
+
+    Priority order matches the documented configuration precedence:
+    Azure OpenAI endpoint+key > OpenAI-compatible base URL > Azure AI project > OpenAI API key.
+    Returns an ``AzureOpenAIResponsesClient`` or ``OpenAIResponsesClient`` instance.
+    """
+    from azure.identity import DefaultAzureCredential
+
+    from agent_framework.azure import AzureOpenAIResponsesClient
+    from agent_framework.openai import OpenAIResponsesClient
+
+    azure_openai_base_url = normalize_openai_base_url(AZURE_OPENAI_ENDPOINT)
+    if azure_openai_base_url and AZURE_OPENAI_API_KEY and AZURE_OPENAI_MODEL_ID:
+        return OpenAIResponsesClient(
+            base_url=azure_openai_base_url,
+            api_key=AZURE_OPENAI_API_KEY,
+            model_id=AZURE_OPENAI_MODEL_ID,
+        )
+
+    if OPENAI_BASE_URL and OPENAI_API_KEY and OPENAI_RESPONSES_MODEL_ID:
+        return OpenAIResponsesClient(
+            base_url=normalize_openai_base_url(OPENAI_BASE_URL),
+            api_key=OPENAI_API_KEY,
+            model_id=OPENAI_RESPONSES_MODEL_ID,
+        )
+
+    if AZURE_AI_PROJECT_ENDPOINT and AZURE_OPENAI_MODEL_ID:
+        return AzureOpenAIResponsesClient(
+            project_endpoint=AZURE_AI_PROJECT_ENDPOINT,
+            deployment_name=AZURE_OPENAI_MODEL_ID,
+            credential=DefaultAzureCredential(exclude_interactive_browser_credential=False),
+        )
+
+    if OPENAI_API_KEY and OPENAI_RESPONSES_MODEL_ID:
+        return OpenAIResponsesClient(
+            api_key=OPENAI_API_KEY,
+            model_id=OPENAI_RESPONSES_MODEL_ID,
+        )
+
+    raise RuntimeError(
+        "No supported model configuration is available. Configure Azure AI project variables, Azure OpenAI API key "
+        "variables, or direct OpenAI responses variables."
+    )
+
+
 def ensure_output_dir() -> Path:
     """Ensure the output directory exists and return it."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

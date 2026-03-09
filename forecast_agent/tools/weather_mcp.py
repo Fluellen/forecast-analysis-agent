@@ -133,6 +133,14 @@ def build_weather_for_period_payload(start_date: str, end_date: str, pivot_date:
     weekly_buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     week_starts: dict[str, str] = {}
 
+    _weather_codes = daily.get("weather_code") or [None] * len(dates)
+    _temp_means = daily.get("temperature_2m_mean") or [None] * len(dates)
+    _temp_maxs = daily.get("temperature_2m_max") or [None] * len(dates)
+    _temp_mins = daily.get("temperature_2m_min") or [None] * len(dates)
+    _precips = daily.get("precipitation_sum") or [None] * len(dates)
+    _winds = daily.get("wind_speed_10m_max") or [None] * len(dates)
+    _clouds = daily.get("cloud_cover_mean") or [None] * len(dates)
+
     for index, raw_day in enumerate(dates):
         day = date.fromisoformat(raw_day)
         iso_year, iso_week, _ = day.isocalendar()
@@ -141,13 +149,13 @@ def build_weather_for_period_payload(start_date: str, end_date: str, pivot_date:
         week_starts[week_id] = monday
         weekly_buckets[week_id].append(
             {
-                "weather_code": daily.get("weather_code", [None] * len(dates))[index],
-                "temperature_2m_mean": daily.get("temperature_2m_mean", [None] * len(dates))[index],
-                "temperature_2m_max": daily.get("temperature_2m_max", [None] * len(dates))[index],
-                "temperature_2m_min": daily.get("temperature_2m_min", [None] * len(dates))[index],
-                "precipitation_sum": daily.get("precipitation_sum", [None] * len(dates))[index],
-                "wind_speed_10m_max": daily.get("wind_speed_10m_max", [None] * len(dates))[index],
-                "cloud_cover_mean": daily.get("cloud_cover_mean", [None] * len(dates))[index],
+                "weather_code": _weather_codes[index],
+                "temperature_2m_mean": _temp_means[index],
+                "temperature_2m_max": _temp_maxs[index],
+                "temperature_2m_min": _temp_mins[index],
+                "precipitation_sum": _precips[index],
+                "wind_speed_10m_max": _winds[index],
+                "cloud_cover_mean": _clouds[index],
             }
         )
 
