@@ -91,26 +91,26 @@ class AGUIEvent:
         return f"data: {json.dumps(self.to_payload())}\n\n"
 
 
-def run_started(run_id: str, cinv: int, *, thread_id: str | None = None) -> AGUIEvent:
-    thread_id = thread_id or f"cinv-{cinv}"
+def run_started(run_id: str, cinv: int | None, *, thread_id: str | None = None) -> AGUIEvent:
+    thread_id = thread_id or (f"cinv-{cinv}" if cinv is not None else run_id)
     if RunStartedEvent is not None:
         return AGUIEvent(
             RunStartedEvent(
-                threadId=thread_id,
-                runId=run_id,
+                thread_id=thread_id,
+                run_id=run_id,
             ),
             {"run_id": run_id, "cinv": cinv},
         )
     return AGUIEvent(_FallbackEvent(EventType.RUN_STARTED.value, {"run_id": run_id, "cinv": cinv}))
 
 
-def run_finished(run_id: str, cinv: int, *, thread_id: str | None = None, result: Any | None = None) -> AGUIEvent:
-    thread_id = thread_id or f"cinv-{cinv}"
+def run_finished(run_id: str, cinv: int | None, *, thread_id: str | None = None, result: Any | None = None) -> AGUIEvent:
+    thread_id = thread_id or (f"cinv-{cinv}" if cinv is not None else run_id)
     if RunFinishedEvent is not None:
         return AGUIEvent(
             RunFinishedEvent(
-                threadId=thread_id,
-                runId=run_id,
+                thread_id=thread_id,
+                run_id=run_id,
                 result=result,
             ),
             {"run_id": run_id, "cinv": cinv},
@@ -132,19 +132,19 @@ def run_error(run_id: str, error: str, *, code: str | None = None) -> AGUIEvent:
 
 def text_message_start(message_id: str) -> AGUIEvent:
     if TextMessageStartEvent is not None:
-        return AGUIEvent(TextMessageStartEvent(messageId=message_id, role="assistant"), {"message_id": message_id})
+        return AGUIEvent(TextMessageStartEvent(message_id=message_id, role="assistant"), {"message_id": message_id})
     return AGUIEvent(_FallbackEvent(EventType.TEXT_MESSAGE_START.value, {"message_id": message_id, "role": "assistant"}))
 
 
 def text_message_chunk(message_id: str, chunk: str) -> AGUIEvent:
     if TextMessageContentEvent is not None:
-        return AGUIEvent(TextMessageContentEvent(messageId=message_id, delta=chunk), {"message_id": message_id})
+        return AGUIEvent(TextMessageContentEvent(message_id=message_id, delta=chunk), {"message_id": message_id})
     return AGUIEvent(_FallbackEvent(EventType.TEXT_MESSAGE_CONTENT.value, {"message_id": message_id, "delta": chunk}))
 
 
 def text_message_end(message_id: str) -> AGUIEvent:
     if TextMessageEndEvent is not None:
-        return AGUIEvent(TextMessageEndEvent(messageId=message_id), {"message_id": message_id})
+        return AGUIEvent(TextMessageEndEvent(message_id=message_id), {"message_id": message_id})
     return AGUIEvent(_FallbackEvent(EventType.TEXT_MESSAGE_END.value, {"message_id": message_id}))
 
 
@@ -158,9 +158,9 @@ def tool_call_start(tool_call_id: str, tool_name: str, args: dict[str, Any], *, 
     if ToolCallStartEvent is not None:
         return AGUIEvent(
             ToolCallStartEvent(
-                toolCallId=tool_call_id,
-                toolCallName=tool_name,
-                parentMessageId=parent_message_id,
+                tool_call_id=tool_call_id,
+                tool_call_name=tool_name,
+                parent_message_id=parent_message_id,
             ),
             payload,
         )
@@ -175,7 +175,7 @@ def tool_call_args(tool_call_id: str, delta: str, tool_name: str) -> AGUIEvent:
         "category": _tool_category(tool_name),
     }
     if ToolCallArgsEvent is not None:
-        return AGUIEvent(ToolCallArgsEvent(toolCallId=tool_call_id, delta=delta), payload)
+        return AGUIEvent(ToolCallArgsEvent(tool_call_id=tool_call_id, delta=delta), payload)
     return AGUIEvent(_FallbackEvent(EventType.TOOL_CALL_ARGS.value, payload))
 
 
@@ -188,7 +188,7 @@ def tool_call_end(tool_call_id: str, tool_name: str, duration_ms: float, result:
         "category": _tool_category(tool_name),
     }
     if ToolCallEndEvent is not None:
-        return AGUIEvent(ToolCallEndEvent(toolCallId=tool_call_id), payload)
+        return AGUIEvent(ToolCallEndEvent(tool_call_id=tool_call_id), payload)
     return AGUIEvent(_FallbackEvent(EventType.TOOL_CALL_END.value, payload))
 
 
@@ -204,8 +204,8 @@ def tool_call_result(tool_call_id: str, tool_name: str, result: str, *, message_
     if ToolCallResultEvent is not None:
         return AGUIEvent(
             ToolCallResultEvent(
-                messageId=message_id,
-                toolCallId=tool_call_id,
+                message_id=message_id,
+                tool_call_id=tool_call_id,
                 content=result,
                 role="tool",
             ),

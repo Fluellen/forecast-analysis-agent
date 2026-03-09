@@ -8,7 +8,7 @@ import json
 
 from rich.console import Console
 
-from forecast_agent.agent import ForecastAnalysisAgent
+from forecast_agent.agent import run_analysis
 
 console = Console()
 
@@ -35,8 +35,7 @@ async def _run(args: argparse.Namespace) -> int:
     if cinv is None:
         raise SystemExit("A CINV must be provided either positionally or via --cinv.")
 
-    agent = ForecastAnalysisAgent()
-    state = await agent.run_analysis(cinv, force_weather=args.force_weather)
+    state = await run_analysis(cinv, force_weather=args.force_weather)
 
     if args.json:
         console.print_json(json.dumps(state, default=str))

@@ -1,15 +1,5 @@
-"""Forecast Analysis Agent package."""
+"""Forecast Analysis workflow package."""
 
-from __future__ import annotations
+from .agent import create_forecast_workflow, get_cleanup_hooks, run_analysis, run_analysis_stream
 
-from typing import Any
-
-__all__ = ["ForecastAnalysisAgent"]
-
-
-def __getattr__(name: str) -> Any:
-	if name == "ForecastAnalysisAgent":
-		from .agent import ForecastAnalysisAgent
-
-		return ForecastAnalysisAgent
-	raise AttributeError(name)
+__all__ = ["create_forecast_workflow", "get_cleanup_hooks", "run_analysis", "run_analysis_stream"]

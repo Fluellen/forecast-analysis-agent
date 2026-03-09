@@ -10,7 +10,7 @@ import subprocess
 import sys
 import threading
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pandas as pd
@@ -20,12 +20,12 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from starlette.websockets import WebSocketState
+from websockets.typing import Subprotocol
 
 import forecast_agent.config as cfg
-from forecast_agent.agent import ForecastAnalysisAgent
-from forecast_agent.cinv_resolution import resolve_analysis_request
+from forecast_agent.agent import run_analysis_stream
 from forecast_agent.data_access import list_available_articles
-from forecast_agent.events import run_error, state_delta
+from forecast_agent.events import run_error
 
 _streamlit_process: subprocess.Popen[str] | None = None
 logger = logging.getLogger(__name__)
@@ -75,18 +75,8 @@ async def run_analysis(request: Request) -> StreamingResponse:
 
     async def event_generator():
         try:
-            resolution = await resolve_analysis_request(cinv=cinv, input_text=input_text)
-            resolved_cinv = int(resolution["cinv"])
-            yield state_delta(
-                {
-                    "selected_cinv": resolved_cinv,
-                    "input_resolution": resolution,
-                    "input_request_text": resolution.get("input_text") or (str(cinv) if cinv is not None else input_text),
-                }
-            ).to_sse()
-
-            agent = ForecastAnalysisAgent()
-            async for event in agent.run_analysis_stream(resolved_cinv, force_weather=force_weather):
+            request_value = str(cinv) if cinv is not None else input_text
+            async for event in run_analysis_stream(request_value, force_weather=force_weather):
                 yield event.to_sse()
                 await asyncio.sleep(0)
         except Exception as exc:
@@ -177,7 +167,7 @@ async def websocket_proxy(websocket: WebSocket, path: str) -> None:
         async with websockets.connect(
             upstream_url,
             additional_headers=_websocket_upstream_headers(websocket),
-            subprotocols=_requested_subprotocols(websocket) or None,
+            subprotocols=cast(list[Subprotocol] | None, _requested_subprotocols(websocket) or None),
             max_size=None,
         ) as upstream:
             await websocket.accept(subprotocol=upstream.subprotocol)

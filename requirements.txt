@@ -1,5 +1,6 @@
 agent-framework-core>=1.0.0rc3
 agent-framework-ag-ui>=1.0.0b260304
+agent-framework-devui>=1.0.0b260304
 aiohttp>=3.10.0
 azure-identity>=1.17.1
 fastapi>=0.111.0

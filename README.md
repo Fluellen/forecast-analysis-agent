@@ -2,6 +2,8 @@
 
 Forecast Analysis Agent is a planner-facing demo built on Microsoft Agent Framework. It analyses a single article CINV from local CSV data, runs forecast diagnostics, optionally adds weather context when justified, and produces a planner report plus a client-facing email.
 
+The repository now also includes Microsoft Agent Framework DevUI integration for interactive agent testing and the OpenAI-compatible DevUI backend API.
+
 Hosted demo: https://www.marcellmeri.online/
 
 ## What The Demo Does
@@ -21,7 +23,7 @@ Browser / Streamlit UI
 FastAPI server (SSE + Streamlit proxy)
     |
     v
-ForecastAnalysisAgent
+Forecast Analysis Workflow
     |
     v
 forecast_agent/tools
@@ -38,10 +40,12 @@ forecast-analysis-agent/
     server.py               FastAPI API and SSE endpoint
     start.py                local entrypoint for API + UI
     run_agent.py            CLI runner
+    run_devui.py            DevUI launcher for the workflow
+    devui_entities/         DevUI discovery exports
     data/                   local CSV datasets
     output/                 generated reports and emails
     forecast_agent/
-        agent.py            agent orchestration and stream state
+        agent.py            workflow orchestration and stream state
         config.py           environment and path config
         data_access.py      shared CSV loading and normalization
         templates.py        system prompt and output templates
@@ -100,11 +104,43 @@ python run_agent.py 4685056
 python run_agent.py --cinv 4685056 --force-weather --json
 ```
 
+### 6. Run in Microsoft DevUI
+
+The app exposes the same Forecast Analysis Workflow directly to Microsoft Agent Framework DevUI using the documented `serve()` and discovery patterns from the local DevUI package under `../agent-framework/python/packages/devui`.
+
+Programmatic launch:
+
+```powershell
+python run_devui.py --port 8080
+```
+
+Then open `http://127.0.0.1:8080`.
+
+Directory-discovery launch with the DevUI CLI:
+
+```powershell
+$env:PYTHONPATH='.'
+devui .\devui_entities --port 8080
+```
+
+Useful DevUI endpoints:
+
+- `GET /v1/entities` lists the registered entities.
+- `POST /v1/responses` exposes the OpenAI-compatible Responses API.
+
+If you want to test against the local DevUI source from this workspace instead of the published package, install it from the sibling repository:
+
+```powershell
+pip install -e ..\agent-framework\python\packages\devui
+```
+
 ## API Surface
 
-- `POST /api/run`: start an agent run and receive `text/event-stream`
+- `POST /api/run`: start a workflow run and receive `text/event-stream`
 - `GET /api/health`: configuration and readiness status
 - `GET /api/cinvs`: available article identifiers from local data
+- `GET /v1/entities`: DevUI entity discovery endpoint when running `run_devui.py`
+- `POST /v1/responses`: OpenAI-compatible DevUI Responses API when running `run_devui.py`
 
 Example run payload:
 
@@ -124,5 +160,6 @@ Example run payload:
 ## Troubleshooting
 
 - API unreachable: start the app with `python start.py` or launch the backend with `uvicorn server:app --reload`.
+- DevUI import errors: run from the project root and set `PYTHONPATH=.` when using the `devui` CLI discovery mode.
 - Tavily output missing: set `TAVILY_API_KEY`.
 - Weather output missing: check the `Logs` view first; weather only runs automatically when the weather-sensitivity gate approves it unless `--force-weather` or the UI override is used.
