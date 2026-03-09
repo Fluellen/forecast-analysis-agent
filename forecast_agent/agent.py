@@ -7,6 +7,7 @@ import json
 import re
 import uuid
 from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 from jinja2 import Template
@@ -151,12 +152,12 @@ Important analysis rules:
 """.strip()
 
 
+@dataclass(slots=True)
 class WorkflowInput:
-    """Simple container for workflow invocation parameters."""
+    """Structured workflow invocation parameters."""
 
-    def __init__(self, request_text: str, force_weather: bool) -> None:
-        self.request_text = request_text
-        self.force_weather = force_weather
+    request_text: str
+    force_weather: bool = False
 
 
 def _json_clone(value: dict[str, Any]) -> dict[str, Any]:
@@ -534,7 +535,7 @@ def _extract_completion_state(data: Any) -> dict[str, Any] | None:
 
 
 @executor(id=RESOLVE_AND_IDENTIFY_ID)
-async def resolve_and_identify(raw_input: Any, ctx: WorkflowContext[dict[str, Any]]) -> None:
+async def resolve_and_identify(raw_input: WorkflowInput, ctx: WorkflowContext[dict[str, Any]]) -> None:
     request_text, force_weather = _normalize_request_input(raw_input)
     if not request_text:
         raise ValueError("A CINV or free-form analysis request is required.")
