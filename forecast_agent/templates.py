@@ -59,8 +59,12 @@ SYSTEM_PROMPT = dedent(
 
     STEP 5 — WEATHER CONTEXT
       Decide whether weather enrichment is needed using the Step 1 search result.
-      If `weather_sensitivity.recommended` is true, or the product/search evidence
-      makes weather a plausible demand driver, call correlate_weather_with_demand.
+      Call correlate_weather_with_demand only when `weather_sensitivity.recommended`
+      is true, or when the search result explicitly says that customer demand rises,
+      falls, or spikes with weather conditions such as temperature, heat, rain, snow,
+      or storms.
+      Do not call weather enrichment for staple or household products when the search
+      evidence only mentions generic seasonality, storms, or operational disruption.
       If the user forced weather enrichment, you must call correlate_weather_with_demand
       even if the search evidence is weak.
       This tool already retrieves the relevant historical weather window and

@@ -9,56 +9,57 @@ import numpy as np
 import pandas as pd
 
 from ..data_access import get_article_forecast_frame, get_article_links_frame, normalize_for_json, to_week_id
-from .data_tools import get_article_links, get_forecast_data
-from .weather_mcp import get_weather_for_period
+from .data_tools import build_article_links_payload, build_forecast_data_payload
+from .weather_mcp import build_weather_for_period_payload
 
 
-def _loads(raw: str) -> dict[str, Any]:
-    return json.loads(raw)
+def _json(data: dict[str, Any]) -> str:
+    return json.dumps(data, default=str)
+
+
+def _weather_correlation_payload(
+    interpretation: str,
+    *,
+    weeks_joined: int = 0,
+    weeks_used_for_correlation: int | None = None,
+    weather_weeks: list[dict[str, Any]] | None = None,
+    weather_impacted_weeks: list[dict[str, Any]] | None = None,
+    correlations: dict[str, float | None] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "weeks_joined": int(weeks_joined),
+        "correlations": correlations or {"precipitation": None, "temperature": None, "wind": None},
+        "weather_weeks": weather_weeks or [],
+        "weather_impacted_weeks": weather_impacted_weeks or [],
+        "interpretation": interpretation,
+    }
+    if weeks_used_for_correlation is not None:
+        payload["weeks_used_for_correlation"] = int(weeks_used_for_correlation)
+    return payload
 
 
 def correlate_weather_with_demand(art_cinv: int) -> str:
     """Correlate weekly Dublin weather with weekly article demand and flag weather-impacted weeks."""
-    forecast_payload = _loads(get_forecast_data(int(art_cinv)))
+    forecast_payload = build_forecast_data_payload(int(art_cinv))
     rows = forecast_payload.get("rows", [])
     if not rows:
-        return json.dumps(
-            {
-                "weeks_joined": 0,
-                "correlations": {"precipitation": None, "temperature": None, "wind": None},
-                "weather_weeks": [],
-                "weather_impacted_weeks": [],
-                "interpretation": "No forecast history was available for this article.",
-            }
-        )
+        return _json(_weather_correlation_payload("No forecast history was available for this article."))
 
     start_date = rows[0].get("MVT_DATE")
     end_date = rows[-1].get("MVT_DATE")
     pivot_date = forecast_payload.get("pivot_date")
-    weather_payload = _loads(get_weather_for_period(start_date, end_date, pivot_date=pivot_date))
+    weather_payload = build_weather_for_period_payload(start_date, end_date, pivot_date=pivot_date)
     if not weather_payload.get("api_available"):
-        return json.dumps(
-            {
-                "weeks_joined": 0,
-                "correlations": {"precipitation": None, "temperature": None, "wind": None},
-                "weather_weeks": [],
-                "weather_impacted_weeks": [],
-                "interpretation": "Weather context was unavailable, so no weather-demand correlation could be assessed.",
-            }
+        return _json(
+            _weather_correlation_payload(
+                "Weather context was unavailable, so no weather-demand correlation could be assessed."
+            )
         )
 
     demand = pd.DataFrame(rows)
     weather = pd.DataFrame(weather_payload.get("weeks", []))
     if demand.empty or weather.empty:
-        return json.dumps(
-            {
-                "weeks_joined": 0,
-                "correlations": {"precipitation": None, "temperature": None, "wind": None},
-                "weather_weeks": [],
-                "weather_impacted_weeks": [],
-                "interpretation": "There was insufficient overlap between demand history and weather history.",
-            }
-        )
+        return _json(_weather_correlation_payload("There was insufficient overlap between demand history and weather history."))
 
     demand["MVT_DATE_DT"] = pd.to_datetime(demand["MVT_DATE"], errors="coerce")
     iso = demand["MVT_DATE_DT"].dt.isocalendar()
@@ -67,15 +68,11 @@ def correlate_weather_with_demand(art_cinv: int) -> str:
     demand["FORECAST"] = pd.to_numeric(demand["FORECAST"], errors="coerce")
     overlap = demand.merge(weather, on="week_id", how="inner").sort_values("MVT_DATE_DT").copy()
     if overlap.empty:
-        return json.dumps(
-            {
-                "weeks_joined": 0,
-                "weeks_used_for_correlation": 0,
-                "correlations": {"precipitation": None, "temperature": None, "wind": None},
-                "weather_weeks": [],
-                "weather_impacted_weeks": [],
-                "interpretation": "There was insufficient overlap between demand history and weather history.",
-            }
+        return _json(
+            _weather_correlation_payload(
+                "There was insufficient overlap between demand history and weather history.",
+                weeks_used_for_correlation=0,
+            )
         )
 
     merged = overlap[overlap["ACTUAL_DEMAND"] > 0].copy()
@@ -127,19 +124,19 @@ def correlate_weather_with_demand(art_cinv: int) -> str:
         for row in overlap.itertuples()
     ]
 
-    return json.dumps(
-        {
-            "weeks_joined": int(len(overlap)),
-            "weeks_used_for_correlation": int(len(merged)),
-            "correlations": {
+    return _json(
+        _weather_correlation_payload(
+            interpretation,
+            weeks_joined=len(overlap),
+            weeks_used_for_correlation=len(merged),
+            weather_weeks=weather_weeks,
+            weather_impacted_weeks=impacted,
+            correlations={
                 "precipitation": _corr("total_precip_mm"),
                 "temperature": _corr("avg_temp_max_c"),
                 "wind": _corr("max_wind_kmh"),
             },
-            "weather_weeks": weather_weeks,
-            "weather_impacted_weeks": impacted,
-            "interpretation": interpretation,
-        }
+        )
     )
 
 
@@ -149,7 +146,7 @@ def analyse_year_on_year_trend(art_cinv: int) -> str:
     frame = frame[frame["ACTUAL_DEMAND"] > 0].copy()
 
     if frame.empty:
-        return json.dumps(
+        return _json(
             {
                 "weeks_analysed": 0,
                 "summary": {
@@ -232,7 +229,7 @@ def analyse_year_on_year_trend(art_cinv: int) -> str:
         f"{below_all} weeks underperformed all historical anchors, while {above_all} weeks beat them all."
     )
 
-    return json.dumps(
+    return _json(
         {
             "weeks_analysed": int(len(detail)),
             "summary": {
@@ -251,10 +248,10 @@ def analyse_year_on_year_trend(art_cinv: int) -> str:
 
 def get_article_links_demand(art_cinv: int) -> str:
     """Summarize demand for linked articles to assess substitution effects and duplicate links."""
-    links_payload = _loads(get_article_links(int(art_cinv)))
+    links_payload = build_article_links_payload(int(art_cinv))
     links = links_payload.get("links", [])
     if not links:
-        return json.dumps(
+        return _json(
             {
                 "source_cinv": int(art_cinv),
                 "linked_articles": [],
@@ -343,7 +340,7 @@ def get_article_links_demand(art_cinv: int) -> str:
             "No duplicate link rows were detected. Use these demand baselines to judge whether the focal article's volatility may reflect substitution behaviour."
         )
 
-    return json.dumps(
+    return _json(
         {
             "source_cinv": int(art_cinv),
             "linked_articles": summaries,

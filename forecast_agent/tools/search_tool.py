@@ -38,6 +38,24 @@ PRODUCT_WEATHER_SIGNALS = {
     "coffee": 1,
 }
 
+NON_WEATHER_STAPLE_SIGNALS = {
+    "toilet tissue": 5,
+    "toilet paper": 5,
+    "tissue paper": 4,
+    "paper towel": 4,
+    "paper towels": 4,
+    "kitchen roll": 4,
+    "napkin": 3,
+    "napkins": 3,
+    "household paper": 4,
+    "detergent": 3,
+    "laundry": 2,
+    "cleaning": 2,
+    "soap": 2,
+    "shampoo": 2,
+    "toothpaste": 2,
+}
+
 EVIDENCE_WEATHER_SIGNALS = {
     "weather": 2,
     "temperature": 2,
@@ -54,6 +72,28 @@ EVIDENCE_WEATHER_SIGNALS = {
     "sunny": 2,
     "summer": 1,
     "winter": 1,
+}
+
+WEATHER_DEMAND_DRIVER_SIGNALS = {
+    "weather-sensitive": 4,
+    "weather sensitive": 4,
+    "temperature-sensitive": 4,
+    "temperature sensitive": 4,
+    "hot weather increases demand": 5,
+    "warm weather increases demand": 5,
+    "cold weather increases demand": 5,
+    "demand rises in hot weather": 5,
+    "demand rises during hot weather": 5,
+    "demand rises in warm weather": 5,
+    "demand falls in cold weather": 4,
+    "demand increases in summer": 4,
+    "summer demand spike": 4,
+    "heatwave demand": 4,
+    "rain drives demand": 4,
+    "weather-driven demand": 5,
+    "weather driven demand": 5,
+    "temperature affects demand": 4,
+    "temperature-driven demand": 4,
 }
 
 HOLIDAY_DEMAND_POSITIVE_SIGNALS = {
@@ -232,27 +272,44 @@ def _assess_weather_sensitivity(
     )
 
     product_hits = _collect_signal_hits(article_context, PRODUCT_WEATHER_SIGNALS)
+    staple_hits = _collect_signal_hits(article_context, NON_WEATHER_STAPLE_SIGNALS)
     evidence_hits = _collect_signal_hits(evidence_text, EVIDENCE_WEATHER_SIGNALS)
+    demand_driver_hits = _collect_signal_hits(evidence_text, WEATHER_DEMAND_DRIVER_SIGNALS)
 
     merged_hits: dict[str, int] = {}
-    for signal, weight in product_hits + evidence_hits:
+    for signal, weight in product_hits + evidence_hits + demand_driver_hits:
         merged_hits[signal] = max(weight, merged_hits.get(signal, 0))
 
+    product_score = sum(weight for _, weight in product_hits)
+    staple_score = sum(weight for _, weight in staple_hits)
+    generic_evidence_score = sum(weight for _, weight in evidence_hits)
+    demand_driver_score = sum(weight for _, weight in demand_driver_hits)
     score = sum(merged_hits.values())
     strong_product_signal = any(weight >= 4 for _, weight in product_hits)
-    explicit_weather_evidence = any(weight >= 2 for _, weight in evidence_hits)
+    direct_weather_demand_evidence = demand_driver_score >= 4
+    meaningful_weather_evidence = generic_evidence_score >= 4
+    blocked_as_staple = staple_score >= 4 and not strong_product_signal and not direct_weather_demand_evidence
 
-    if strong_product_signal or score >= 6:
+    if blocked_as_staple:
+        classification = "unlikely"
+        recommended = False
+        rationale = (
+            "Article context points to a staple household product, and the available search evidence does not show that customer demand itself is materially weather-driven. "
+            "Generic weather or storm mentions are not enough to justify weather enrichment."
+        )
+    elif strong_product_signal and staple_score == 0:
         classification = "likely"
         recommended = True
-        rationale = "Article context or search evidence suggests demand is materially weather-sensitive."
-    elif explicit_weather_evidence or score >= 3:
+        rationale = "Article context strongly suggests that demand is materially weather-sensitive."
+    elif direct_weather_demand_evidence and (product_score >= 2 or meaningful_weather_evidence):
+        classification = "likely"
+        recommended = True
+        rationale = "Search evidence explicitly links demand changes to weather conditions, so weather enrichment is warranted."
+    elif demand_driver_score >= 2 or (product_score >= 2 and generic_evidence_score >= 2):
         classification = "possible"
-        recommended = score >= 4
+        recommended = False
         rationale = (
-            "Some weather-linked demand signals were found, so weather enrichment may be worth checking."
-            if recommended
-            else "Some weak weather-linked signals were found, but not enough to require weather enrichment by default."
+            "Some weather-linked signals were found, but the evidence is not strong enough to show that demand is materially weather-driven."
         )
     else:
         classification = "unlikely"
@@ -264,7 +321,12 @@ def _assess_weather_sensitivity(
         "classification": classification,
         "recommended": recommended,
         "score": score,
+        "product_score": product_score,
+        "evidence_score": generic_evidence_score,
+        "demand_driver_score": demand_driver_score,
+        "staple_score": staple_score,
         "matched_signals": matched_signals,
+        "blocking_signals": [signal for signal, _ in staple_hits[:6]],
         "rationale": rationale,
     }
 

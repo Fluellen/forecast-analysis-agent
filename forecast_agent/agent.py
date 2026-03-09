@@ -66,6 +66,94 @@ TOOL_TO_STEP = {
     "correlate_weather_with_demand": 5,
 }
 
+TOOL_STATE_FIELDS = (
+    "article_name",
+    "category",
+    "pivot_date",
+    "flagged_weeks",
+    "stockout_risk",
+    "weather_sensitivity",
+    "weather_enrichment_recommended",
+    "weather_enrichment_activated",
+    "weather_weeks",
+)
+
+
+def _json_clone(value: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(value, default=str))
+
+
+def _load_json_object(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"raw": raw}
+        return payload if isinstance(payload, dict) else {"raw": payload}
+    return {"raw": raw}
+
+
+def _tool_state_delta(state: dict[str, Any]) -> dict[str, Any]:
+    return {field: state.get(field) for field in TOOL_STATE_FIELDS}
+
+
+def _apply_tool_payload(state: dict[str, Any], tool_payloads: dict[str, Any], tool_name: str, payload: dict[str, Any]) -> None:
+    tool_payloads[tool_name] = payload
+    if tool_name == "get_article_metadata":
+        metadata = payload.get("metadata") or []
+        if metadata:
+            first = metadata[0]
+            state["article_name"] = first.get("ART_DESC", "") or state["article_name"]
+            state["category"] = first.get("ART_LEVEL1_DESC", "") or state["category"]
+    elif tool_name == "search_article_characteristics":
+        state["weather_sensitivity"] = payload.get("weather_sensitivity") or {}
+        state["weather_enrichment_recommended"] = bool(payload.get("weather_enrichment_recommended"))
+    elif tool_name == "get_forecast_data":
+        state["pivot_date"] = payload.get("pivot_date") or state["pivot_date"]
+    elif tool_name == "detect_pre_pivot_stockout_risk":
+        state["stockout_risk"] = payload
+    elif tool_name == "detect_outlier_weeks":
+        flagged = []
+        for item in payload.get("outliers", [])[:12]:
+            reasons: list[str] = []
+            if item.get("iqr_outlier"):
+                reasons.append("IQR outlier")
+            z_score = item.get("z_score")
+            if z_score is not None and abs(float(z_score)) > 2:
+                reasons.append(f"z-score {z_score}")
+            if item.get("has_promo"):
+                reasons.append("promo week")
+            if item.get("has_holiday"):
+                reasons.append(item.get("holiday_name") or "holiday week")
+            flagged.append(
+                {
+                    "week_id": item.get("week_id"),
+                    "mvt_date": item.get("MVT_DATE"),
+                    "actual_demand": item.get("ACTUAL_DEMAND"),
+                    "forecast": item.get("FORECAST"),
+                    "reason": ", ".join(reasons) or "statistical outlier",
+                }
+            )
+        state["flagged_weeks"] = flagged
+    elif tool_name == "correlate_weather_with_demand":
+        state["weather_enrichment_activated"] = True
+        state["weather_weeks"] = payload.get("weather_weeks") or []
+        existing = {item["week_id"] for item in state.get("flagged_weeks", []) if item.get("week_id")}
+        for item in payload.get("weather_impacted_weeks", []):
+            if item.get("week_id") in existing:
+                continue
+            state.setdefault("flagged_weeks", []).append(
+                {
+                    "week_id": item.get("week_id"),
+                    "mvt_date": item.get("MVT_DATE"),
+                    "actual_demand": item.get("ACTUAL_DEMAND"),
+                    "forecast": item.get("FORECAST"),
+                    "reason": f"severe weather: {item.get('weather_description', 'weather disruption')}",
+                }
+            )
+
 
 class ForecastAnalysisAgent:
     """Forecast agent wrapper that streams AG-UI events while the SDK runs the model and tools."""
@@ -172,13 +260,13 @@ class ForecastAnalysisAgent:
         self.last_state = state.copy()
 
         try:
-            state["stockout_risk"] = json.loads(detect_pre_pivot_stockout_risk(cinv))
+            state["stockout_risk"] = _load_json_object(detect_pre_pivot_stockout_risk(cinv))
         except Exception:
             state["stockout_risk"] = {}
 
         def update_state(**updates: Any) -> AGUIEvent:
             state.update(updates)
-            self.last_state = json.loads(json.dumps(state, default=str))
+            self.last_state = _json_clone(state)
             return state_delta(updates)
 
         async def transition_step(step_number: int) -> AsyncGenerator[AGUIEvent, None]:
@@ -193,61 +281,6 @@ class ForecastAnalysisAgent:
                 step_state[str(step_number)] = "in_progress"
                 yield step_started(STEP_NAMES[step_number], step_number)
                 yield update_state(steps=step_state.copy(), current_step=step_number)
-
-        def apply_tool_payload(tool_name: str, payload: dict[str, Any]) -> None:
-            tool_payloads[tool_name] = payload
-            if tool_name == "get_article_metadata":
-                metadata = payload.get("metadata") or []
-                if metadata:
-                    first = metadata[0]
-                    state["article_name"] = first.get("ART_DESC", "") or state["article_name"]
-                    state["category"] = first.get("ART_LEVEL1_DESC", "") or state["category"]
-            elif tool_name == "search_article_characteristics":
-                state["weather_sensitivity"] = payload.get("weather_sensitivity") or {}
-                state["weather_enrichment_recommended"] = bool(payload.get("weather_enrichment_recommended"))
-            elif tool_name == "get_forecast_data":
-                state["pivot_date"] = payload.get("pivot_date") or state["pivot_date"]
-            elif tool_name == "detect_pre_pivot_stockout_risk":
-                state["stockout_risk"] = payload
-            elif tool_name == "detect_outlier_weeks":
-                flagged = []
-                for item in payload.get("outliers", [])[:12]:
-                    reasons: list[str] = []
-                    if item.get("iqr_outlier"):
-                        reasons.append("IQR outlier")
-                    z_score = item.get("z_score")
-                    if z_score is not None and abs(float(z_score)) > 2:
-                        reasons.append(f"z-score {z_score}")
-                    if item.get("has_promo"):
-                        reasons.append("promo week")
-                    if item.get("has_holiday"):
-                        reasons.append(item.get("holiday_name") or "holiday week")
-                    flagged.append(
-                        {
-                            "week_id": item.get("week_id"),
-                            "mvt_date": item.get("MVT_DATE"),
-                            "actual_demand": item.get("ACTUAL_DEMAND"),
-                            "forecast": item.get("FORECAST"),
-                            "reason": ", ".join(reasons) or "statistical outlier",
-                        }
-                    )
-                state["flagged_weeks"] = flagged
-            elif tool_name == "correlate_weather_with_demand":
-                state["weather_enrichment_activated"] = True
-                state["weather_weeks"] = payload.get("weather_weeks") or []
-                existing = {item["week_id"] for item in state.get("flagged_weeks", []) if item.get("week_id")}
-                for item in payload.get("weather_impacted_weeks", []):
-                    if item.get("week_id") in existing:
-                        continue
-                    state.setdefault("flagged_weeks", []).append(
-                        {
-                            "week_id": item.get("week_id"),
-                            "mvt_date": item.get("MVT_DATE"),
-                            "actual_demand": item.get("ACTUAL_DEMAND"),
-                            "forecast": item.get("FORECAST"),
-                            "reason": f"severe weather: {item.get('weather_description', 'weather disruption')}",
-                        }
-                    )
 
         token = runtime.set_weather_forced(force_weather)
         try:
@@ -308,22 +341,9 @@ class ForecastAnalysisAgent:
                         yield tool_call_end(tool_call_id, tool_name, duration_ms, result_text)
                         yield tool_call_result(tool_call_id, tool_name, result_text, message_id=active_message_id or str(uuid.uuid4()))
 
-                        try:
-                            payload = json.loads(result_text)
-                        except json.JSONDecodeError:
-                            payload = {"raw": result_text}
-                        apply_tool_payload(tool_name, payload)
-                        yield update_state(
-                            article_name=state.get("article_name", ""),
-                            category=state.get("category", ""),
-                            pivot_date=state.get("pivot_date", ""),
-                            flagged_weeks=state.get("flagged_weeks", []),
-                            stockout_risk=state.get("stockout_risk", {}),
-                            weather_sensitivity=state.get("weather_sensitivity", {}),
-                            weather_enrichment_recommended=state.get("weather_enrichment_recommended", False),
-                            weather_enrichment_activated=state.get("weather_enrichment_activated", False),
-                            weather_weeks=state.get("weather_weeks", []),
-                        )
+                        payload = _load_json_object(result_text)
+                        _apply_tool_payload(state, tool_payloads, tool_name, payload)
+                        yield update_state(**_tool_state_delta(state))
 
                     elif content_type == "text":
                         chunk = getattr(content, "text", "") or ""
@@ -375,7 +395,7 @@ class ForecastAnalysisAgent:
             console.print_exception(show_locals=False)
             state["status"] = "error"
             state["error"] = str(exc)
-            self.last_state = json.loads(json.dumps(state, default=str))
+            self.last_state = _json_clone(state)
             yield state_snapshot(state.copy())
             yield run_error(run_id, str(exc), code=type(exc).__name__)
         finally:
@@ -398,12 +418,7 @@ def _split_deliverables(text: str) -> tuple[str, str]:
 
 
 def _get_stockout_reporting_guidance(state: dict[str, Any]) -> tuple[str, float | None]:
-    stockout_risk = state.get("stockout_risk") or {}
-    if isinstance(stockout_risk, str):
-        try:
-            stockout_risk = json.loads(stockout_risk)
-        except json.JSONDecodeError:
-            return "", None
+    stockout_risk = _load_json_object(state.get("stockout_risk") or {})
     if not stockout_risk.get("stockout_risk_detected"):
         return "", None
 

@@ -10,7 +10,6 @@ import re
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -19,14 +18,18 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from forecast_agent.data_access import get_article_links_frame, load_metadata_frame
+from forecast_agent.data_access import (
+    get_article_links_frame,
+    list_available_articles,
+    load_forecast_frame,
+    load_links_frame,
+    load_metadata_frame,
+)
 from forecast_agent.templates import SYSTEM_PROMPT
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-ROOT_DIR = Path(__file__).resolve().parent
-DATA_DIR = ROOT_DIR / "data"
 API_PORT = int(os.getenv("API_PORT", "8000"))
 API_BASE = f"http://127.0.0.1:{API_PORT}"
 DISPLAY_TEXT_BATCH_CHARS = 1200
@@ -62,30 +65,14 @@ st.set_page_config(page_title="Forecast Analysis Agent", layout="wide", initial_
 # ===================================================================
 @st.cache_data(show_spinner=False)
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    forecast = pd.read_csv(DATA_DIR / "forecast_data.csv")
-    metadata = pd.read_csv(DATA_DIR / "article_metadata.csv")
-    links = pd.read_csv(DATA_DIR / "links.csv")
+    forecast = load_forecast_frame().copy()
+    metadata = load_metadata_frame().copy()
+    links = load_links_frame().copy()
 
-    forecast.columns = [column.strip() for column in forecast.columns]
-    metadata.columns = [column.strip() for column in metadata.columns]
-    links.columns = [column.strip() for column in links.columns]
-
-    for frame in (forecast, metadata, links):
-        if "ART_CINV" in frame.columns:
-            frame["ART_CINV"] = pd.to_numeric(frame["ART_CINV"], errors="coerce").astype("Int64")
-
-    for column in ("PIVOT_DATE", "MVT_DATE"):
-        if column in forecast.columns:
-            forecast[f"{column}_DT"] = pd.to_datetime(forecast[column].astype(str), format="%Y%m%d", errors="coerce")
-
-    forecast["FORECAST_ERROR"] = pd.to_numeric(forecast.get("FORECAST_ERROR"), errors="coerce")
-    forecast["FORECAST"] = pd.to_numeric(forecast.get("FORECAST"), errors="coerce")
-    forecast["ACTUAL_DEMAND"] = pd.to_numeric(forecast.get("ACTUAL_DEMAND"), errors="coerce")
-    forecast["NM1"] = pd.to_numeric(forecast.get("NM1"), errors="coerce")
-    forecast["NM2"] = pd.to_numeric(forecast.get("NM2"), errors="coerce")
-    forecast["NM3"] = pd.to_numeric(forecast.get("NM3"), errors="coerce")
-    forecast_iso = forecast["MVT_DATE_DT"].dt.isocalendar()
-    forecast["WEEK_ID"] = forecast_iso["year"].astype(str) + "-W" + forecast_iso["week"].astype(str).str.zfill(2)
+    if "FORECAST_ERROR" in forecast.columns:
+        forecast["FORECAST_ERROR"] = pd.to_numeric(forecast["FORECAST_ERROR"], errors="coerce")
+    else:
+        forecast["FORECAST_ERROR"] = pd.NA
 
     return forecast, metadata, links
 
@@ -291,16 +278,13 @@ def append_trace(category: str, title: str, detail: str, status: str) -> None:
 # ===================================================================
 # HELPERS (preserved)
 # ===================================================================
-def build_cinv_options(metadata: pd.DataFrame, forecast: pd.DataFrame) -> list[dict[str, Any]]:
-    cinvs = forecast[["ART_CINV"]].dropna().drop_duplicates()
-    names = metadata[["ART_CINV", "ART_DESC"]].drop_duplicates(subset=["ART_CINV"], keep="first")
-    merged = cinvs.merge(names, on="ART_CINV", how="left").sort_values("ART_CINV")
+def build_cinv_options() -> list[dict[str, Any]]:
     return [
         {
-            "cinv": int(row.ART_CINV),
-            "label": f"{int(row.ART_CINV)} | {row.ART_DESC if isinstance(row.ART_DESC, str) else 'Unknown article'}",
+            "cinv": item["cinv"],
+            "label": f"{item['cinv']} | {item['name'] if item.get('name') and item['name'] != 'Unknown' else 'Unknown article'}",
         }
-        for row in merged.itertuples()
+        for item in list_available_articles()
     ]
 
 
@@ -1854,7 +1838,7 @@ def render_observability_tab() -> None:
 ensure_state()
 render_css()
 forecast_df, metadata_df, _links_df = load_data()
-options = build_cinv_options(metadata_df, forecast_df)
+options = build_cinv_options()
 drain_events()
 
 render_top_nav()

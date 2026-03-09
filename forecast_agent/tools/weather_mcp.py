@@ -70,23 +70,21 @@ def _resolve_weather_window(start_date: str, end_date: str, pivot_date: str | No
     return start, capped_end, pivot
 
 
-def get_weather_for_period(start_date: str, end_date: str, pivot_date: str | None = None) -> str:
-    """Fetch Dublin weekly weather summaries for a historical window capped at pivot date or today."""
+def build_weather_for_period_payload(start_date: str, end_date: str, pivot_date: str | None = None) -> dict[str, Any]:
+    """Build the JSON-ready weekly Dublin weather summary payload."""
     try:
         effective_start, effective_end, resolved_pivot = _resolve_weather_window(start_date, end_date, pivot_date)
     except ValueError as exc:
-        return _json(
-            {
-                "location": "Dublin, Ireland",
-                "data_source": "Open-Meteo API unavailable",
-                "api_available": False,
-                "error": f"Invalid date input: {exc}",
-                "forced_by_user": runtime.is_weather_forced(),
-                "requested_window": {"start_date": start_date, "end_date": end_date, "pivot_date": pivot_date},
-                "weeks": [],
-                "severe_weeks": [],
-            }
-        )
+        return {
+            "location": "Dublin, Ireland",
+            "data_source": "Open-Meteo API unavailable",
+            "api_available": False,
+            "error": f"Invalid date input: {exc}",
+            "forced_by_user": runtime.is_weather_forced(),
+            "requested_window": {"start_date": start_date, "end_date": end_date, "pivot_date": pivot_date},
+            "weeks": [],
+            "severe_weeks": [],
+        }
 
     params = {
         "latitude": config.DUBLIN_LATITUDE,
@@ -112,25 +110,23 @@ def get_weather_for_period(start_date: str, end_date: str, pivot_date: str | Non
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
-        return _json(
-            {
-                "location": "Dublin, Ireland",
-                "data_source": "Open-Meteo API unavailable",
-                "api_available": False,
-                "error": str(exc),
-                "forced_by_user": runtime.is_weather_forced(),
-                "requested_window": {"start_date": start_date, "end_date": end_date, "pivot_date": pivot_date},
-                "effective_window": {
-                    "start_date": effective_start.isoformat(),
-                    "end_date": effective_end.isoformat(),
-                    "pivot_date": resolved_pivot.isoformat() if resolved_pivot else None,
-                    "capped_to_pivot_date": bool(resolved_pivot and effective_end == resolved_pivot),
-                    "capped_to_today": bool(effective_end == date.today()),
-                },
-                "weeks": [],
-                "severe_weeks": [],
-            }
-        )
+        return {
+            "location": "Dublin, Ireland",
+            "data_source": "Open-Meteo API unavailable",
+            "api_available": False,
+            "error": str(exc),
+            "forced_by_user": runtime.is_weather_forced(),
+            "requested_window": {"start_date": start_date, "end_date": end_date, "pivot_date": pivot_date},
+            "effective_window": {
+                "start_date": effective_start.isoformat(),
+                "end_date": effective_end.isoformat(),
+                "pivot_date": resolved_pivot.isoformat() if resolved_pivot else None,
+                "capped_to_pivot_date": bool(resolved_pivot and effective_end == resolved_pivot),
+                "capped_to_today": bool(effective_end == date.today()),
+            },
+            "weeks": [],
+            "severe_weeks": [],
+        }
 
     daily = payload.get("daily") or {}
     dates = daily.get("time") or []
@@ -195,21 +191,24 @@ def get_weather_for_period(start_date: str, end_date: str, pivot_date: str | Non
             }
         )
 
-    return _json(
-        {
-            "location": "Dublin, Ireland",
-            "data_source": "Open-Meteo Archive API",
-            "api_available": True,
-            "forced_by_user": runtime.is_weather_forced(),
-            "requested_window": {"start_date": start_date, "end_date": end_date, "pivot_date": pivot_date},
-            "effective_window": {
-                "start_date": effective_start.isoformat(),
-                "end_date": effective_end.isoformat(),
-                "pivot_date": resolved_pivot.isoformat() if resolved_pivot else None,
-                "capped_to_pivot_date": bool(resolved_pivot and effective_end == resolved_pivot),
-                "capped_to_today": bool(effective_end == date.today()),
-            },
-            "weeks": weeks,
-            "severe_weeks": severe_weeks,
-        }
-    )
+    return {
+        "location": "Dublin, Ireland",
+        "data_source": "Open-Meteo Archive API",
+        "api_available": True,
+        "forced_by_user": runtime.is_weather_forced(),
+        "requested_window": {"start_date": start_date, "end_date": end_date, "pivot_date": pivot_date},
+        "effective_window": {
+            "start_date": effective_start.isoformat(),
+            "end_date": effective_end.isoformat(),
+            "pivot_date": resolved_pivot.isoformat() if resolved_pivot else None,
+            "capped_to_pivot_date": bool(resolved_pivot and effective_end == resolved_pivot),
+            "capped_to_today": bool(effective_end == date.today()),
+        },
+        "weeks": weeks,
+        "severe_weeks": severe_weeks,
+    }
+
+
+def get_weather_for_period(start_date: str, end_date: str, pivot_date: str | None = None) -> str:
+    """Fetch Dublin weekly weather summaries for a historical window capped at pivot date or today."""
+    return _json(build_weather_for_period_payload(start_date, end_date, pivot_date=pivot_date))

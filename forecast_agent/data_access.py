@@ -197,3 +197,17 @@ def get_article_links_frame(art_cinv: int) -> pd.DataFrame:
     """Return direct link rows for an article."""
     frame = load_links_frame()
     return frame[frame["art_cinv_a"] == art_cinv].copy()
+
+
+def list_available_articles() -> list[dict[str, Any]]:
+    """Return available article identifiers with their best-known labels."""
+    forecast = load_forecast_frame()[["ART_CINV"]].dropna().drop_duplicates()
+    metadata = load_metadata_frame().drop_duplicates(subset=["ART_CINV"], keep="first")
+    merged = forecast.merge(metadata, on="ART_CINV", how="left").sort_values("ART_CINV")
+    return [
+        {
+            "cinv": int(row.ART_CINV),
+            "name": str(row.ART_DESC) if not pd.isna(row.ART_DESC) and row.ART_DESC else "Unknown",
+        }
+        for row in merged.itertuples()
+    ]

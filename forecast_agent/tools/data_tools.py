@@ -22,21 +22,38 @@ def _json(data: dict[str, Any]) -> str:
     return json.dumps(data, default=str)
 
 
-def get_article_metadata(art_cinv: int) -> str:
-    """Load article_metadata.csv and return all metadata for the given ART_CINV as JSON."""
+FORECAST_EXPORT_COLUMNS = [
+    "ART_CINV",
+    "PIVOT_DATE",
+    "MVT_DATE",
+    "ISO_YEAR",
+    "ISO_WEEK",
+    "WEEK_ID",
+    "FORECAST",
+    "ACTUAL_DEMAND",
+    "MOVING_AVG",
+    "DC_CODE",
+    "PROMO_TYPE",
+    "HOLIDAYS_TYPE",
+    "NM1",
+    "NM2",
+    "NM3",
+]
+
+
+def build_article_metadata_payload(art_cinv: int) -> dict[str, Any]:
+    """Build the JSON-ready metadata payload for an article."""
     frame = get_article_metadata_frame(int(art_cinv))
     records = frame_to_records(frame)
-    return _json(
-        {
-            "art_cinv": int(art_cinv),
-            "count": len(records),
-            "metadata": records,
-        }
-    )
+    return {
+        "art_cinv": int(art_cinv),
+        "count": len(records),
+        "metadata": records,
+    }
 
 
-def get_forecast_data(art_cinv: int) -> str:
-    """Load forecast_data.csv filtered to the given ART_CINV and return sorted weekly history as JSON."""
+def build_forecast_data_payload(art_cinv: int) -> dict[str, Any]:
+    """Build the JSON-ready forecast history payload for an article."""
     frame = get_article_forecast_frame(int(art_cinv)).copy()
     pivot_date = None
     if not frame.empty:
@@ -44,55 +61,44 @@ def get_forecast_data(art_cinv: int) -> str:
         frame["MVT_DATE"] = frame["MVT_DATE_DT"].dt.strftime("%Y-%m-%d")
         if frame["PIVOT_DATE"].notna().any():
             pivot_date = str(frame["PIVOT_DATE"].dropna().iloc[-1])
-    records = frame_to_records(
-        frame[
-            [
-                "ART_CINV",
-                "PIVOT_DATE",
-                "MVT_DATE",
-                "ISO_YEAR",
-                "ISO_WEEK",
-                "WEEK_ID",
-                "FORECAST",
-                "ACTUAL_DEMAND",
-                "MOVING_AVG",
-                "DC_CODE",
-                "PROMO_TYPE",
-                "HOLIDAYS_TYPE",
-                "NM1",
-                "NM2",
-                "NM3",
-            ]
-        ]
-        if not frame.empty
-        else frame
-    )
 
-    return _json(
-        {
-            "art_cinv": int(art_cinv),
-            "count": len(records),
-            "pivot_date": pivot_date,
-            "date_range": {
-                "start": records[0]["MVT_DATE"] if records else None,
-                "end": records[-1]["MVT_DATE"] if records else None,
-            },
-            "rows": records,
-        }
-    )
+    records = frame_to_records(frame[FORECAST_EXPORT_COLUMNS])
+    return {
+        "art_cinv": int(art_cinv),
+        "count": len(records),
+        "pivot_date": pivot_date,
+        "date_range": {
+            "start": records[0]["MVT_DATE"] if records else None,
+            "end": records[-1]["MVT_DATE"] if records else None,
+        },
+        "rows": records,
+    }
+
+
+def build_article_links_payload(art_cinv: int) -> dict[str, Any]:
+    """Build the JSON-ready direct-links payload for an article."""
+    frame = get_article_links_frame(int(art_cinv)).copy()
+    records = frame_to_records(frame)
+    return {
+        "art_cinv": int(art_cinv),
+        "links": records,
+        "count": len(records),
+    }
+
+
+def get_article_metadata(art_cinv: int) -> str:
+    """Load article_metadata.csv and return all metadata for the given ART_CINV as JSON."""
+    return _json(build_article_metadata_payload(int(art_cinv)))
+
+
+def get_forecast_data(art_cinv: int) -> str:
+    """Load forecast_data.csv filtered to the given ART_CINV and return sorted weekly history as JSON."""
+    return _json(build_forecast_data_payload(int(art_cinv)))
 
 
 def get_article_links(art_cinv: int) -> str:
     """Load links.csv rows where art_cinv_a equals the given article and return them as JSON."""
-    frame = get_article_links_frame(int(art_cinv)).copy()
-    records = frame_to_records(frame)
-    return _json(
-        {
-            "art_cinv": int(art_cinv),
-            "links": records,
-            "count": len(records),
-        }
-    )
+    return _json(build_article_links_payload(int(art_cinv)))
 
 
 def _split_week_id(week_id: str | None) -> tuple[int | None, int | None]:

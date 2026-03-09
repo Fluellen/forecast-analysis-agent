@@ -23,7 +23,7 @@ from starlette.websockets import WebSocketState
 
 import forecast_agent.config as cfg
 from forecast_agent.agent import ForecastAnalysisAgent
-from forecast_agent.data_access import load_forecast_frame, load_metadata_frame
+from forecast_agent.data_access import list_available_articles
 from forecast_agent.events import run_error
 
 _streamlit_process: subprocess.Popen[str] | None = None
@@ -107,18 +107,7 @@ async def health() -> dict[str, Any]:
 
 @app.get("/api/cinvs")
 async def list_cinvs() -> dict[str, list[dict[str, Any]]]:
-    forecast = load_forecast_frame()[["ART_CINV"]].drop_duplicates()
-    metadata = load_metadata_frame().drop_duplicates(subset=["ART_CINV"], keep="first")
-    merged = forecast.merge(metadata, on="ART_CINV", how="left").sort_values("ART_CINV")
-    return {
-        "cinvs": [
-            {
-                "cinv": int(str(row.ART_CINV)),
-                "name": str(row.ART_DESC) if not pd.isna(row.ART_DESC) and row.ART_DESC else "Unknown",
-            }
-            for row in merged.itertuples()
-        ]
-    }
+    return {"cinvs": list_available_articles()}
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
