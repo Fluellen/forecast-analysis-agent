@@ -10,10 +10,11 @@ from textwrap import dedent
 from typing import Any
 
 from agent_framework import AgentResponseUpdate
+import pandas as pd
 from tavily import TavilyClient
 
 from .. import config
-from ..data_access import get_article_forecast_frame, get_article_metadata_frame, normalize_for_json
+from ..data_access import get_article_forecast_frame, get_article_metadata_frame, load_metadata_frame, normalize_for_json
 from ..responses_client import get_responses_client
 
 SEARCH_SUFFIX = "supply chain seasonality demand drivers Ireland retail"
@@ -168,6 +169,7 @@ _WEATHER_DECISION_SCHEMA_VERSION = "weather_decision_v2"
 _WEATHER_CLASSIFICATIONS = {"likely", "possible", "unlikely"}
 _WEATHER_CONFIDENCE_LEVELS = {"high", "medium", "low"}
 _WEATHER_DEMAND_EFFECTS = {"positive", "negative", "mixed", "none", "unclear"}
+_WARM_MONTHS = {5, 6, 7, 8, 9}
 
 
 def _extract_cinv_candidates(query: str) -> list[int]:
@@ -215,6 +217,49 @@ def _compact_sources_for_prompt(sources: list[dict[str, Any]], *, max_items: int
             }
         )
     return compact_sources
+
+
+@lru_cache(maxsize=256)
+def _resolve_article_context_from_query(query: str) -> dict[str, Any]:
+    normalized_query = _clean_query_text(query).lower()
+    if not normalized_query:
+        return {}
+
+    candidates: list[tuple[int, int, str, str]] = []
+    frame = load_metadata_frame()
+    for row in frame.itertuples():
+        article_name = _clean_query_text(str(getattr(row, "ART_DESC", "") or ""))
+        if not article_name:
+            continue
+        lowered_name = article_name.lower()
+        exact_match = normalized_query == lowered_name
+        contained_match = lowered_name in normalized_query or normalized_query in lowered_name
+        if not exact_match and not contained_match:
+            continue
+
+        category_parts = [
+            _clean_query_text(str(getattr(row, "ART_LEVEL1_DESC", "") or "")),
+            _clean_query_text(str(getattr(row, "ART_LEVEL2_DESC", "") or "")),
+            _clean_query_text(str(getattr(row, "ART_LEVEL3_DESC", "") or "")),
+        ]
+        category_text = " ".join(part for part in category_parts if part)
+        score = len(lowered_name) + (1000 if exact_match else 0)
+        candidates.append((score, int(getattr(row, "ART_CINV")), article_name, category_text))
+
+    if not candidates:
+        return {}
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    top_score, top_cinv, top_article_name, top_category_text = candidates[0]
+    if len(candidates) > 1 and candidates[1][0] == top_score and candidates[1][1] != top_cinv:
+        return {}
+
+    return {
+        "rewritten_from_cinv": False,
+        "source_cinv": top_cinv,
+        "article_name": top_article_name,
+        "category_text": top_category_text,
+    }
 
 
 def _collect_unique_holidays(art_cinv: int) -> tuple[list[str], list[dict[str, Any]], str | None]:
@@ -411,6 +456,246 @@ def _assess_weather_sensitivity(
     }
 
 
+def _assess_history_weather_signal(source_cinv: Any) -> dict[str, Any]:
+    result = {
+        "available": False,
+        "art_cinv": int(source_cinv) if isinstance(source_cinv, int) else None,
+        "positive_actual_weeks": 0,
+        "warm_weeks": 0,
+        "cool_weeks": 0,
+        "warm_avg_demand": None,
+        "cool_avg_demand": None,
+        "warm_to_cool_ratio": None,
+        "dominant_pattern": "insufficient_data",
+        "peak_months": [],
+        "classification": "unlikely",
+        "recommended": False,
+        "confidence": "low",
+        "demand_effect": "unclear",
+        "supporting_evidence": [],
+        "rationale": "No article history was available to assess observed weather-linked seasonality.",
+    }
+    if not isinstance(source_cinv, int):
+        return result
+
+    frame = get_article_forecast_frame(source_cinv).copy()
+    if frame.empty:
+        return result
+
+    frame["ACTUAL_DEMAND"] = pd.to_numeric(frame["ACTUAL_DEMAND"], errors="coerce")
+    frame = frame[(frame["ACTUAL_DEMAND"] > 0) & frame["MVT_DATE_DT"].notna()].copy()
+    if frame.empty:
+        return result
+
+    frame["month"] = pd.to_datetime(frame["MVT_DATE_DT"], errors="coerce").dt.month
+    warm = frame[frame["month"].isin(_WARM_MONTHS)]["ACTUAL_DEMAND"].dropna()
+    cool = frame[~frame["month"].isin(_WARM_MONTHS)]["ACTUAL_DEMAND"].dropna()
+    result.update(
+        {
+            "available": True,
+            "positive_actual_weeks": int(len(frame)),
+            "warm_weeks": int(len(warm)),
+            "cool_weeks": int(len(cool)),
+        }
+    )
+
+    if len(warm) < 6 or len(cool) < 6:
+        result["rationale"] = "The article does not have enough positive-demand weeks across warm and non-warm periods to assess weather-linked seasonality."
+        return result
+
+    warm_avg = float(warm.mean())
+    cool_avg = float(cool.mean())
+    warm_to_cool_ratio = round(warm_avg / cool_avg, 2) if cool_avg > 0 else None
+    monthly_avg = frame.groupby("month")["ACTUAL_DEMAND"].mean().sort_values(ascending=False)
+    peak_months = [int(month) for month in monthly_avg.head(3).index.tolist()]
+    warm_peak_months = sum(1 for month in peak_months if month in _WARM_MONTHS)
+
+    result.update(
+        {
+            "warm_avg_demand": round(warm_avg, 2),
+            "cool_avg_demand": round(cool_avg, 2),
+            "warm_to_cool_ratio": warm_to_cool_ratio,
+            "peak_months": peak_months,
+        }
+    )
+
+    if warm_to_cool_ratio is not None and warm_to_cool_ratio >= 1.35 and warm_peak_months >= 2:
+        result.update(
+            {
+                "dominant_pattern": "warm_peak",
+                "classification": "likely",
+                "recommended": True,
+                "confidence": "high" if warm_to_cool_ratio >= 1.55 else "medium",
+                "demand_effect": "positive",
+                "supporting_evidence": [
+                    f"Warm-month average demand is {round((warm_to_cool_ratio - 1) * 100, 1)}% above non-warm months.",
+                    f"Peak demand months include {', '.join(str(month) for month in peak_months[:3])}.",
+                ],
+                "rationale": "Observed history shows materially stronger demand in warm months, which is consistent with weather-sensitive demand.",
+            }
+        )
+    elif warm_to_cool_ratio is not None and warm_to_cool_ratio >= 1.2:
+        result.update(
+            {
+                "dominant_pattern": "mild_warm_peak",
+                "classification": "possible",
+                "recommended": False,
+                "confidence": "medium",
+                "demand_effect": "positive",
+                "supporting_evidence": [
+                    f"Warm-month average demand is {round((warm_to_cool_ratio - 1) * 100, 1)}% above non-warm months.",
+                ],
+                "rationale": "Observed demand is somewhat stronger in warm months, but the seasonal uplift is not strong enough on its own to justify weather enrichment.",
+            }
+        )
+    else:
+        result.update(
+            {
+                "dominant_pattern": "flat_or_non_warm",
+                "classification": "unlikely",
+                "recommended": False,
+                "confidence": "medium",
+                "demand_effect": "unclear",
+                "supporting_evidence": [],
+                "rationale": "Observed demand history does not show a strong warm-season pattern that would justify weather enrichment by itself.",
+            }
+        )
+
+    return result
+
+
+def _should_consult_weather_llm(heuristic_assessment: dict[str, Any], history_assessment: dict[str, Any]) -> bool:
+    if bool(heuristic_assessment.get("recommended")):
+        return False
+    if bool(history_assessment.get("recommended")):
+        return False
+    if heuristic_assessment.get("blocking_signals"):
+        return False
+    return True
+
+
+def _combine_weather_sensitivity_decisions(
+    heuristic_assessment: dict[str, Any],
+    history_assessment: dict[str, Any],
+    llm_assessment: dict[str, Any] | None,
+    llm_error: str | None,
+) -> dict[str, Any]:
+    llm_assessment = llm_assessment or {}
+    heuristic_positive = bool(heuristic_assessment.get("recommended"))
+    history_positive = bool(history_assessment.get("recommended"))
+    llm_positive = bool(llm_assessment.get("recommended"))
+    blocking_signals = [str(item).strip() for item in heuristic_assessment.get("blocking_signals") or [] if str(item).strip()]
+    staple_blocked = bool(blocking_signals)
+
+    gate_reasons: list[str] = []
+    matched_signals: list[str] = []
+    supporting_evidence: list[str] = []
+    demand_effect = "unclear"
+
+    if history_positive:
+        gate_reasons.append("observed_warm_seasonality")
+    if heuristic_positive:
+        gate_reasons.append("product_signal")
+    if llm_positive and not staple_blocked:
+        gate_reasons.append("llm_recommendation")
+    if staple_blocked:
+        gate_reasons.append("staple_block")
+
+    matched_signals.extend(str(item).strip() for item in heuristic_assessment.get("matched_signals") or [] if str(item).strip())
+    matched_signals.extend(str(item).strip() for item in llm_assessment.get("matched_signals") or [] if str(item).strip())
+    if history_assessment.get("dominant_pattern") == "warm_peak":
+        matched_signals.append("observed warm-month demand uplift")
+
+    supporting_evidence.extend(
+        str(item).strip() for item in history_assessment.get("supporting_evidence") or [] if str(item).strip()
+    )
+    supporting_evidence.extend(
+        str(item).strip() for item in llm_assessment.get("supporting_evidence") or [] if str(item).strip()
+    )
+    if heuristic_positive and heuristic_assessment.get("rationale"):
+        supporting_evidence.append(str(heuristic_assessment["rationale"]).strip())
+
+    if history_positive or heuristic_positive:
+        recommended = True
+        classification = "likely"
+        confidence = "high" if history_positive or heuristic_positive else "medium"
+        decision_source = "hybrid_local_override"
+    elif llm_positive and not staple_blocked:
+        recommended = True
+        classification = "likely"
+        confidence = str(llm_assessment.get("confidence") or "medium")
+        decision_source = "hybrid_llm"
+    else:
+        recommended = False
+        if any(
+            assessment.get("classification") == "possible"
+            for assessment in [heuristic_assessment, history_assessment, llm_assessment]
+            if isinstance(assessment, dict) and assessment
+        ):
+            classification = "possible"
+            confidence = "medium"
+        else:
+            classification = "unlikely"
+            confidence = "high" if staple_blocked else str(llm_assessment.get("confidence") or history_assessment.get("confidence") or "medium")
+        decision_source = "hybrid"
+
+    for candidate in [history_assessment, llm_assessment, heuristic_assessment]:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_effect = str(candidate.get("demand_effect") or "").strip().lower()
+        if candidate_effect and candidate_effect not in {"unclear", "none"}:
+            demand_effect = candidate_effect
+            break
+
+    matched_signals = list(dict.fromkeys(matched_signals))[:6]
+    blocking_signals = list(dict.fromkeys(blocking_signals + [str(item).strip() for item in llm_assessment.get("blocking_signals") or [] if str(item).strip()]))[:6]
+    supporting_evidence = list(dict.fromkeys(item for item in supporting_evidence if item))[:6]
+
+    evidence_parts: list[str] = []
+    if history_positive:
+        evidence_parts.append(str(history_assessment.get("rationale") or "").strip())
+    if heuristic_positive:
+        evidence_parts.append(str(heuristic_assessment.get("rationale") or "").strip())
+    elif llm_assessment.get("evidence_summary"):
+        evidence_parts.append(str(llm_assessment.get("evidence_summary") or "").strip())
+    elif history_assessment.get("rationale"):
+        evidence_parts.append(str(history_assessment.get("rationale") or "").strip())
+    elif heuristic_assessment.get("rationale"):
+        evidence_parts.append(str(heuristic_assessment.get("rationale") or "").strip())
+    evidence_summary = " ".join(part for part in evidence_parts if part).strip() or "No strong weather-sensitivity evidence was identified."
+
+    if recommended:
+        rationale = evidence_summary
+    elif staple_blocked:
+        rationale = "Local product signals indicate a staple product without strong evidence of weather-driven demand, so weather enrichment is skipped."
+    else:
+        rationale = evidence_summary
+
+    return {
+        "classification": classification,
+        "recommended": recommended,
+        "schema_version": _WEATHER_DECISION_SCHEMA_VERSION,
+        "decision_source": decision_source,
+        "confidence": confidence,
+        "demand_effect": demand_effect,
+        "evidence_summary": evidence_summary,
+        "score": heuristic_assessment.get("score"),
+        "product_score": heuristic_assessment.get("product_score"),
+        "evidence_score": heuristic_assessment.get("evidence_score"),
+        "demand_driver_score": heuristic_assessment.get("demand_driver_score"),
+        "staple_score": heuristic_assessment.get("staple_score"),
+        "matched_signals": matched_signals,
+        "blocking_signals": blocking_signals,
+        "supporting_evidence": supporting_evidence,
+        "rationale": rationale,
+        "gate_reasons": gate_reasons,
+        "heuristic_assessment": heuristic_assessment,
+        "history_assessment": history_assessment,
+        "llm_assessment": llm_assessment or None,
+        "llm_error": llm_error,
+    }
+
+
 def _normalize_llm_weather_sensitivity(payload: dict[str, Any]) -> dict[str, Any]:
     required_fields = {
         "schema_version",
@@ -561,12 +846,23 @@ def _decide_weather_sensitivity(
     answer: str,
     sources: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    try:
-        return asyncio.run(_assess_weather_sensitivity_llm(original_query, rewrite_info, answer, sources))
-    except Exception as exc:
-        fallback = _assess_weather_sensitivity(original_query, rewrite_info, answer, sources)
-        fallback["llm_error"] = str(exc)
-        return fallback
+    heuristic_assessment = _assess_weather_sensitivity(original_query, rewrite_info, answer, sources)
+    history_assessment = _assess_history_weather_signal(rewrite_info.get("source_cinv"))
+
+    llm_assessment: dict[str, Any] | None = None
+    llm_error: str | None = None
+    if _should_consult_weather_llm(heuristic_assessment, history_assessment):
+        try:
+            llm_assessment = asyncio.run(_assess_weather_sensitivity_llm(original_query, rewrite_info, answer, sources))
+        except Exception as exc:
+            llm_error = str(exc)
+
+    return _combine_weather_sensitivity_decisions(
+        heuristic_assessment=heuristic_assessment,
+        history_assessment=history_assessment,
+        llm_assessment=llm_assessment,
+        llm_error=llm_error,
+    )
 
 
 @lru_cache(maxsize=128)
@@ -603,6 +899,13 @@ def _normalize_search_query(query: str) -> tuple[str, dict[str, Any]]:
             "category_text": category_text,
         }
 
+    resolved_context = _resolve_article_context_from_query(original_query)
+    article_name = str(resolved_context.get("article_name") or "").strip()
+    if article_name:
+        category_text = str(resolved_context.get("category_text") or "").strip()
+        normalized_query = " ".join(part for part in [article_name, category_text, SEARCH_SUFFIX] if part)
+        return _clean_query_text(normalized_query), resolved_context
+
     return original_query, {
         "rewritten_from_cinv": False,
         "source_cinv": None,
@@ -614,9 +917,9 @@ def _normalize_search_query(query: str) -> tuple[str, dict[str, Any]]:
 def search_article_characteristics(query: str) -> str:
     """Search the web for demand drivers, seasonality, and supply-chain characteristics for an article."""
     normalized_query, rewrite_info = _normalize_search_query(query)
-    weather_sensitivity = _decide_weather_sensitivity(query, rewrite_info, "", [])
 
     if not config.TAVILY_API_KEY:
+        weather_sensitivity = _decide_weather_sensitivity(query, rewrite_info, "", [])
         return json.dumps(
             {
                 "query": normalized_query,
@@ -633,6 +936,7 @@ def search_article_characteristics(query: str) -> str:
 
     result, error = _run_tavily_search(normalized_query, max_results=5)
     if error:
+        weather_sensitivity = _decide_weather_sensitivity(query, rewrite_info, "", [])
         return json.dumps(
             {
                 "query": normalized_query,

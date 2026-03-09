@@ -256,7 +256,7 @@ def _build_characteristics_query(metadata_payload: dict[str, Any], art_cinv: int
         first = metadata[0]
         article_name = str(first.get("ART_DESC") or "").strip()
         if article_name:
-            return f"{article_name} supply chain seasonality demand drivers Ireland retail"
+            return f"{art_cinv} {article_name} supply chain seasonality demand drivers Ireland retail"
     return str(art_cinv)
 
 
