@@ -63,13 +63,6 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-If you are using the sibling local `agent-framework` checkout instead of released packages:
-
-```powershell
-pip install -e ..\agent-framework\python\packages\core
-pip install -e ..\agent-framework\python\packages\ag-ui
-```
-
 ### 3. Configure `.env`
 
 Copy [.env.example](.env.example) to `.env` and set one supported model configuration:
