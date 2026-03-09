@@ -8,6 +8,10 @@ import json
 
 from rich.console import Console
 
+from forecast_agent.observability import configure_observability, shutdown_observability
+
+configure_observability()
+
 from forecast_agent.agent import ForecastAnalysisAgent
 
 console = Console()
@@ -52,7 +56,10 @@ async def _run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    return asyncio.run(_run(args))
+    try:
+        return asyncio.run(_run(args))
+    finally:
+        shutdown_observability()
 
 
 if __name__ == "__main__":

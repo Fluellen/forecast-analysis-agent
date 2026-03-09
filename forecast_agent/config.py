@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 
@@ -28,6 +29,10 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_RESPONSES_MODEL_ID = os.getenv("OPENAI_RESPONSES_MODEL_ID", "") or os.getenv("OPENAI_MODEL", "")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
+LANGFUSE_BASE_URL = os.getenv("LANGFUSE_BASE_URL", "")
+LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "")
 
 AZURE_OPENAI_MODEL_ID = AZURE_OPENAI_RESPONSES_DEPLOYMENT_NAME or AZURE_OPENAI_DEPLOYMENT_NAME or AZURE_OPENAI_MODEL
 
@@ -40,6 +45,46 @@ DUBLIN_LATITUDE = 53.3498
 DUBLIN_LONGITUDE = -6.2603
 DUBLIN_TIMEZONE = "Europe/London"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment flag using common truthy values."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+ENABLE_INSTRUMENTATION = env_flag("ENABLE_INSTRUMENTATION", default=False)
+ENABLE_SENSITIVE_DATA = env_flag("ENABLE_SENSITIVE_DATA", default=False)
+ENABLE_CONSOLE_EXPORTERS = env_flag("ENABLE_CONSOLE_EXPORTERS", default=False)
+
+
+def langfuse_configured() -> bool:
+    """Return True when the full Langfuse credential set is available."""
+    return bool(LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY and LANGFUSE_BASE_URL)
+
+
+def langfuse_partially_configured() -> bool:
+    """Return True when some, but not all, Langfuse settings are present."""
+    values = [LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL]
+    return any(values) and not all(values)
+
+
+def build_langfuse_traces_endpoint() -> str:
+    """Build the Langfuse OTLP traces endpoint from the configured base URL."""
+    base_url = (LANGFUSE_BASE_URL or LANGFUSE_HOST or "").strip().strip('"').strip("'").rstrip("/")
+    if not base_url:
+        return ""
+    return f"{base_url}/api/public/otel/v1/traces"
+
+
+def build_langfuse_auth_header() -> str:
+    """Build a URL-safe OTLP Authorization header for Langfuse Basic auth."""
+    if not langfuse_configured():
+        return ""
+    auth_token = base64.b64encode(f"{LANGFUSE_PUBLIC_KEY}:{LANGFUSE_SECRET_KEY}".encode("utf-8")).decode("utf-8")
+    return f"Authorization=Basic {auth_token}"
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -120,5 +165,18 @@ def validate() -> list[str]:
 
     if not TAVILY_API_KEY:
         warnings.append("TAVILY_API_KEY is not configured.")
+
+    if langfuse_partially_configured():
+        warnings.append(
+            "Langfuse observability is only partially configured. Set LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and LANGFUSE_BASE_URL together."
+        )
+
+    if langfuse_configured():
+        try:
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter  # noqa: F401
+        except Exception:
+            warnings.append(
+                "Langfuse is configured, but opentelemetry-exporter-otlp-proto-http is not installed. Install requirements.txt to enable tracing export."
+            )
 
     return warnings

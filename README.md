@@ -76,7 +76,34 @@ Copy [.env.example](.env.example) to `.env` and set one supported model configur
 Optional:
 
 - `TAVILY_API_KEY` for live search enrichment
+- `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` for Langfuse tracing
+- `ENABLE_SENSITIVE_DATA=true` in dev/test if you want prompts and responses exported to your telemetry backend
 - `API_PORT` and `STREAMLIT_PORT` to override local ports
+
+### Langfuse Observability
+
+This app follows the Microsoft Agent Framework observability guidance and boots telemetry with `configure_otel_providers()`.
+
+If you set all three Langfuse variables below in `.env`, the app automatically derives the OTLP HTTP/protobuf traces configuration required by Langfuse:
+
+```env
+LANGFUSE_PUBLIC_KEY="pk-lf-..."
+LANGFUSE_SECRET_KEY="sk-lf-..."
+LANGFUSE_BASE_URL="https://cloud.langfuse.com"
+```
+
+Derived automatically by the app:
+
+- `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=<LANGFUSE_BASE_URL>/api/public/otel/v1/traces`
+- `OTEL_EXPORTER_OTLP_TRACES_HEADERS=Authorization=Basic%20<base64(public:secret)>`
+- `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`
+- `OTEL_SERVICE_NAME=forecast-analysis-agent` if not already set
+
+Notes:
+
+- Langfuse export is trace-focused. The app configures the traces endpoint only, which matches Langfuse's OTLP ingestion model.
+- Prompt and response content are not exported unless you explicitly enable `ENABLE_SENSITIVE_DATA=true`.
+- `GET /api/health` includes a sanitized `langfuse` section showing whether observability bootstrapped successfully.
 
 ### 4. Start the app
 

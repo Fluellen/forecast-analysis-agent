@@ -22,6 +22,10 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from starlette.websockets import WebSocketState
 
 import forecast_agent.config as cfg
+from forecast_agent.observability import configure_observability, flush_observability, get_observability_status, shutdown_observability
+
+configure_observability()
+
 from forecast_agent.agent import ForecastAnalysisAgent
 from forecast_agent.cinv_resolution import resolve_analysis_request
 from forecast_agent.data_access import list_available_articles
@@ -53,6 +57,7 @@ async def lifespan(app: FastAPI):
         thread.start()
         await asyncio.sleep(3)
     yield
+    shutdown_observability()
     if _streamlit_process and _streamlit_process.poll() is None:
         _streamlit_process.terminate()
 
@@ -92,6 +97,7 @@ async def run_analysis(request: Request) -> StreamingResponse:
         except Exception as exc:
             yield run_error("unknown", str(exc), code=type(exc).__name__).to_sse()
         finally:
+            flush_observability()
             yield 'data: {"type":"STREAM_END"}\n\n'
 
     return StreamingResponse(
@@ -113,6 +119,7 @@ async def health() -> dict[str, Any]:
         "config_warnings": warnings,
         "agent_framework": True,
         "tavily_search": bool(cfg.TAVILY_API_KEY),
+        "langfuse": get_observability_status(),
         "is_heroku": cfg.IS_HEROKU,
     }
 
