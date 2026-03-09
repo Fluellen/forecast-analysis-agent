@@ -4,6 +4,8 @@ Forecast Analysis Agent is a planner-facing demo built on Microsoft Agent Framew
 
 Hosted demo: https://www.marcellmeri.online/
 
+<img margin-left: auto and margin-right: auto width="1254" height="688" alt="www marcellmeri online_" src="https://github.com/user-attachments/assets/93adde3f-9953-4404-86ca-08db33449797" />
+
 ## What The Demo Does
 
 - loads article metadata, weekly forecast history, and linked-article relationships
