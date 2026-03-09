@@ -87,11 +87,13 @@ SYSTEM_PROMPT = dedent(
 
     EMAIL TEMPLATE GUIDANCE:
       The draft email to the client should:
-      - Be professional, empathetic, and concise (max 200 words)
+      - Be professional, concise, and operational in tone (max 180 words)
+      - Avoid filler such as "I hope this message finds you well" or "Thank you for your attention"
+      - Use this structure exactly: one short summary paragraph, a `Key observations` block, a `Recommended actions` block, and one short closing sentence requesting client context
       - Mention the specific weeks where disruptions were observed
-      - Reference weather or year-on-year anomalies where found
-      - Explain what action DFAI will take (flag outlier weeks)
-      - Invite the client to provide feedback or additional context
+      - Reference weather or year-on-year anomalies only when supported by tool output
+      - Explain what action DFAI will take, including outlier exclusion and any xout or article-link remediation when relevant
+      - Do not repeat the same fact in multiple sections
       - Be signed: "Kind regards, DFAI Managed Services"
 
     BEHAVIOURAL GUIDELINES:

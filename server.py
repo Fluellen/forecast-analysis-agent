@@ -23,8 +23,9 @@ from starlette.websockets import WebSocketState
 
 import forecast_agent.config as cfg
 from forecast_agent.agent import ForecastAnalysisAgent
+from forecast_agent.cinv_resolution import resolve_analysis_request
 from forecast_agent.data_access import list_available_articles
-from forecast_agent.events import run_error
+from forecast_agent.events import run_error, state_delta
 
 _streamlit_process: subprocess.Popen[str] | None = None
 logger = logging.getLogger(__name__)
@@ -67,18 +68,29 @@ STREAMLIT_WS_BASE = f"ws://127.0.0.1:{cfg.STREAMLIT_PORT}"
 async def run_analysis(request: Request) -> StreamingResponse:
     body = await request.json()
     cinv = body.get("cinv")
+    input_text = str(body.get("input_text") or body.get("request_text") or body.get("message") or "").strip()
     force_weather = bool(body.get("force_weather", body.get("use_weather", False)))
-    if cinv is None:
-        raise HTTPException(status_code=400, detail="cinv is required")
+    if cinv is None and not input_text:
+        raise HTTPException(status_code=400, detail="Either cinv or input_text is required")
 
     async def event_generator():
         try:
+            resolution = await resolve_analysis_request(cinv=cinv, input_text=input_text)
+            resolved_cinv = int(resolution["cinv"])
+            yield state_delta(
+                {
+                    "selected_cinv": resolved_cinv,
+                    "input_resolution": resolution,
+                    "input_request_text": resolution.get("input_text") or (str(cinv) if cinv is not None else input_text),
+                }
+            ).to_sse()
+
             agent = ForecastAnalysisAgent()
-            async for event in agent.run_analysis_stream(int(cinv), force_weather=force_weather):
+            async for event in agent.run_analysis_stream(resolved_cinv, force_weather=force_weather):
                 yield event.to_sse()
                 await asyncio.sleep(0)
         except Exception as exc:
-            yield run_error("unknown", str(exc)).to_sse()
+            yield run_error("unknown", str(exc), code=type(exc).__name__).to_sse()
         finally:
             yield 'data: {"type":"STREAM_END"}\n\n'
 

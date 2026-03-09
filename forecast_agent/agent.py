@@ -71,8 +71,13 @@ TOOL_STATE_FIELDS = (
     "category",
     "pivot_date",
     "flagged_weeks",
+    "forecast_health",
+    "outlier_analysis",
     "stockout_risk",
+    "year_on_year",
+    "link_analysis",
     "weather_sensitivity",
+    "weather_analysis",
     "weather_enrichment_recommended",
     "weather_enrichment_activated",
     "weather_weeks",
@@ -112,9 +117,12 @@ def _apply_tool_payload(state: dict[str, Any], tool_payloads: dict[str, Any], to
         state["weather_enrichment_recommended"] = bool(payload.get("weather_enrichment_recommended"))
     elif tool_name == "get_forecast_data":
         state["pivot_date"] = payload.get("pivot_date") or state["pivot_date"]
+    elif tool_name == "compute_forecast_health":
+        state["forecast_health"] = payload
     elif tool_name == "detect_pre_pivot_stockout_risk":
         state["stockout_risk"] = payload
     elif tool_name == "detect_outlier_weeks":
+        state["outlier_analysis"] = payload
         flagged = []
         for item in payload.get("outliers", [])[:12]:
             reasons: list[str] = []
@@ -137,7 +145,12 @@ def _apply_tool_payload(state: dict[str, Any], tool_payloads: dict[str, Any], to
                 }
             )
         state["flagged_weeks"] = flagged
+    elif tool_name == "analyse_year_on_year_trend":
+        state["year_on_year"] = payload
+    elif tool_name == "get_article_links_demand":
+        state["link_analysis"] = payload
     elif tool_name == "correlate_weather_with_demand":
+        state["weather_analysis"] = payload
         state["weather_enrichment_activated"] = True
         state["weather_weeks"] = payload.get("weather_weeks") or []
         existing = {item["week_id"] for item in state.get("flagged_weeks", []) if item.get("week_id")}
@@ -153,8 +166,6 @@ def _apply_tool_payload(state: dict[str, Any], tool_payloads: dict[str, Any], to
                     "reason": f"severe weather: {item.get('weather_description', 'weather disruption')}",
                 }
             )
-
-
 class ForecastAnalysisAgent:
     """Forecast agent wrapper that streams AG-UI events while the SDK runs the model and tools."""
 
@@ -246,11 +257,16 @@ class ForecastAnalysisAgent:
             "email": "",
             "email_subject": "",
             "flagged_weeks": [],
+            "forecast_health": {},
+            "outlier_analysis": {},
             "weather_sensitivity": {},
+            "weather_analysis": {},
             "weather_enrichment_recommended": False,
             "weather_enrichment_activated": False,
             "weather_weeks": [],
             "stockout_risk": {},
+            "year_on_year": {},
+            "link_analysis": {},
             "steps": step_state.copy(),
             "force_weather": bool(force_weather),
             "run_id": run_id,
@@ -464,16 +480,270 @@ def _ensure_stockout_guidance_in_report(report_markdown: str, state: dict[str, A
     return _insert_after_section(report_markdown, "Data Quality & Recommendations", guidance)
 
 
+def _extract_email_parts(email_text: str, default_subject: str) -> tuple[str, str]:
+    subject = default_subject
+    body = email_text.strip()
+    subject_match = re.search(r"^Subject:\s*(.+)$", body, flags=re.MULTILINE)
+    if subject_match:
+        subject = subject_match.group(1).strip()
+        body = re.sub(r"^Subject:\s*.+$", "", body, count=1, flags=re.MULTILINE).strip()
+
+    body = re.sub(r"^Dear Client,\s*", "", body, count=1, flags=re.IGNORECASE).strip()
+    body = re.sub(
+        r"Kind regards,\s*DFAI Managed Services\s*$",
+        "",
+        body,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+    return subject, body
+
+
+def _compose_email_text(subject: str, body: str) -> str:
+    email_body = body.strip()
+    if not subject:
+        return email_body
+    if not email_body:
+        return f"Subject: {subject}"
+    return f"Subject: {subject}\n\n{email_body}"
+
+
+def _sentence_case_label(value: str) -> str:
+    return (value or "").replace("_", " ").strip().lower()
+
+
+def _build_email_summary_line(state: dict[str, Any]) -> str:
+    article_name = state.get("article_name") or f"CINV {state.get('cinv', 'unknown')}"
+    forecast_health = _load_json_object(state.get("forecast_health") or {})
+    year_on_year = _load_json_object(state.get("year_on_year") or {})
+    yoy_summary = _load_json_object(year_on_year.get("summary") or {})
+    stockout_risk = _load_json_object(state.get("stockout_risk") or {})
+
+    fragments = [f"We completed a review of the forecast for {article_name}."]
+
+    trend_direction = str(yoy_summary.get("trend_direction") or "").strip().upper()
+    avg_yoy_vs_nm1 = yoy_summary.get("avg_yoy_vs_nm1_pct")
+    if trend_direction and trend_direction != "INSUFFICIENT_DATA" and avg_yoy_vs_nm1 is not None:
+        fragments.append(
+            f"Demand is {trend_direction.lower()} versus last year, with an average change of {float(avg_yoy_vs_nm1):.2f}% against the NM1 benchmark."
+        )
+
+    accuracy_rating = str(forecast_health.get("accuracy_rating") or "").strip().upper()
+    weeks_analysed = forecast_health.get("weeks_analysed")
+    wape_pct = forecast_health.get("wape_pct")
+    if accuracy_rating and accuracy_rating != "INSUFFICIENT_DATA" and weeks_analysed:
+        accuracy_line = f"Forecast accuracy over {int(weeks_analysed)} post-pivot weeks is rated {accuracy_rating.lower()}."
+        if wape_pct is not None:
+            accuracy_line = accuracy_line[:-1] + f", with WAPE at {float(wape_pct):.2f}%."
+        fragments.append(accuracy_line)
+
+    if stockout_risk.get("stockout_risk_detected"):
+        fragments.append("The main risk is a pre-pivot stockout pattern that is distorting the baseline.")
+
+    return " ".join(fragments)
+
+
+def _build_email_observation_lines(state: dict[str, Any]) -> list[str]:
+    observations: list[str] = []
+    stockout_risk = _load_json_object(state.get("stockout_risk") or {})
+    latest_streak = _load_json_object(stockout_risk.get("latest_zero_shipment_streak") or {})
+    forecast_health = _load_json_object(state.get("forecast_health") or {})
+    outlier_analysis = _load_json_object(state.get("outlier_analysis") or {})
+    year_on_year = _load_json_object(state.get("year_on_year") or {})
+    yoy_summary = _load_json_object(year_on_year.get("summary") or {})
+    weather_analysis = _load_json_object(state.get("weather_analysis") or {})
+    link_analysis = _load_json_object(state.get("link_analysis") or {})
+
+    if stockout_risk.get("stockout_risk_detected"):
+        count = latest_streak.get("count")
+        start_week = str(latest_streak.get("start_week_id") or "").strip()
+        end_week = str(latest_streak.get("end_week_id") or "").strip()
+        baseline_pct = stockout_risk.get("baseline_reduction_pct")
+        future_forecast_weeks = stockout_risk.get("future_forecast_weeks")
+        detail = f"{count} consecutive zero-shipment weeks were observed from {start_week} to {end_week}" if count and start_week and end_week else "A pre-pivot zero-shipment streak was observed"
+        if baseline_pct is not None and future_forecast_weeks:
+            detail += f", which likely reduced the forecast baseline by about {float(baseline_pct):.2f}% across {int(future_forecast_weeks)} forecasted weeks"
+        elif baseline_pct is not None:
+            detail += f", which likely reduced the forecast baseline by about {float(baseline_pct):.2f}%"
+        observations.append(detail + ".")
+
+    outliers = outlier_analysis.get("outliers") or []
+    if outliers:
+        top_outliers = outliers[:2]
+        formatted = []
+        for item in top_outliers:
+            week_id = str(item.get("week_id") or "").strip()
+            direction = _sentence_case_label(str(item.get("direction") or ""))
+            holiday_name = str(item.get("holiday_name") or "").strip()
+            if holiday_name:
+                formatted.append(f"{week_id} ({holiday_name}, {direction} demand)")
+            elif week_id:
+                formatted.append(f"{week_id} ({direction} demand)")
+        if formatted:
+            observations.append(f"Additional anomalous weeks were identified around {', '.join(formatted)}.")
+
+    impacted_weeks = weather_analysis.get("weather_impacted_weeks") or []
+    if impacted_weeks:
+        sample = impacted_weeks[:2]
+        impacted_labels = ", ".join(str(item.get("week_id") or "").strip() for item in sample if item.get("week_id"))
+        if impacted_labels:
+            observations.append(f"Weather-related demand disruption was also visible in {impacted_labels}.")
+
+    if link_analysis.get("duplicate_link_warning"):
+        observations.append("Duplicate linked-article rows were detected, so substitution evidence should be interpreted cautiously.")
+
+    if not observations and forecast_health.get("accuracy_rating"):
+        observations.append(
+            f"No single structural driver dominated the review, but the forecast health assessment was rated {str(forecast_health.get('accuracy_rating')).lower()}."
+        )
+
+    return observations[:4]
+
+
+def _build_email_action_lines(state: dict[str, Any]) -> list[str]:
+    actions: list[str] = []
+    stockout_risk = _load_json_object(state.get("stockout_risk") or {})
+    forecast_health = _load_json_object(state.get("forecast_health") or {})
+    flagged_weeks = state.get("flagged_weeks") or []
+    latest_streak = _load_json_object(stockout_risk.get("latest_zero_shipment_streak") or {})
+    affected_period = str(stockout_risk.get("affected_period") or "").strip()
+    if not affected_period:
+        start_week = str(latest_streak.get("start_week_id") or "").strip()
+        end_week = str(latest_streak.get("end_week_id") or "").strip()
+        if start_week and end_week:
+            affected_period = f"{start_week} to {end_week}"
+
+    if stockout_risk.get("stockout_risk_detected"):
+        if affected_period:
+            actions.append(f"Apply xout logic for {affected_period} to rebuild the baseline without the zero-demand distortion.")
+            actions.append(f"Create or extend a temporary article link for {affected_period} to stabilize the forecast baseline.")
+        else:
+            actions.append("Apply xout logic to rebuild the baseline without the zero-demand distortion.")
+            actions.append("Create or extend a temporary article link to stabilize the forecast baseline.")
+    else:
+        for action in stockout_risk.get("recommended_actions") or []:
+            clean_action = str(action or "").strip()
+            if clean_action:
+                actions.append(clean_action)
+
+    if flagged_weeks:
+        actions.append("Flag the most anomalous weeks for model exclusion so they do not distort future learning.")
+
+    if forecast_health.get("tracking_signal_flag"):
+        actions.append("Review model bias and tracking signal before the next forecast refresh.")
+
+    if not actions:
+        actions.append("Keep the current forecast under review and continue monitoring for new anomalies or supply disruptions.")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for action in actions:
+        normalized = action.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(action)
+    return deduped[:3]
+
+
+def _build_structured_email_body(state: dict[str, Any], fallback_body: str) -> str:
+    summary_line = _build_email_summary_line(state)
+    observation_lines = _build_email_observation_lines(state)
+    action_lines = _build_email_action_lines(state)
+
+    body_parts = [summary_line]
+
+    if observation_lines:
+        body_parts.append("Key observations\n- " + "\n- ".join(observation_lines))
+
+    if action_lines:
+        body_parts.append("Recommended actions\n- " + "\n- ".join(action_lines))
+
+    closing = (
+        "Please let us know if there were supply constraints, customer changes, or other business events behind these weeks, "
+        "as that context will help us confirm the final recommendation."
+    )
+    body_parts.append(closing)
+
+    structured_body = "\n\n".join(part.strip() for part in body_parts if part and part.strip())
+    if structured_body.strip():
+        return structured_body
+    return fallback_body.strip()
+
+
+def _email_mentions_stockout_context(email_body: str, state: dict[str, Any]) -> bool:
+    lowered = (email_body or "").lower()
+    if not lowered:
+        return False
+
+    if any(term in lowered for term in ("stockout", "shortage", "zero shipment", "zero-shipment")):
+        return True
+
+    stockout_risk = _load_json_object(state.get("stockout_risk") or {})
+    latest_streak = _load_json_object(stockout_risk.get("latest_zero_shipment_streak") or {})
+    start_week = str(latest_streak.get("start_week_id") or "").lower()
+    end_week = str(latest_streak.get("end_week_id") or "").lower()
+    return bool(start_week and end_week and start_week in lowered and end_week in lowered)
+
+
+def _email_mentions_stockout_remediation(email_body: str) -> bool:
+    lowered = (email_body or "").lower()
+    return any(term in lowered for term in ("xout", "article link", "linked article"))
+
+
 def _ensure_stockout_guidance_in_email(email_text: str, state: dict[str, Any]) -> str:
     guidance, baseline_pct = _get_stockout_reporting_guidance(state)
-    if not guidance or _text_mentions_baseline_reduction(email_text, baseline_pct):
-        return email_text
+    default_subject = state.get("email_subject") or ""
+    subject, email_body = _extract_email_parts(email_text, default_subject)
+    if not guidance or _text_mentions_baseline_reduction(email_body, baseline_pct):
+        return _compose_email_text(subject, email_body)
 
-    stockout_sentence = guidance.replace("The recommended solution is to either ", "DFAI recommends that we either ")
-    email_body = email_text.strip()
+    stockout_risk = _load_json_object(state.get("stockout_risk") or {})
+    latest_streak = _load_json_object(stockout_risk.get("latest_zero_shipment_streak") or {})
+    affected_period = str(stockout_risk.get("affected_period") or "").strip()
+    if not affected_period:
+        start_week = str(latest_streak.get("start_week_id") or "").strip()
+        end_week = str(latest_streak.get("end_week_id") or "").strip()
+        if start_week and end_week:
+            affected_period = f"{start_week} to {end_week}"
+
+    future_forecast_weeks = stockout_risk.get("future_forecast_weeks")
+    baseline_clause = ""
+    if baseline_pct is not None:
+        baseline_clause = f"This likely depressed the forecast baseline by about {baseline_pct:.2f}%"
+        if future_forecast_weeks:
+            baseline_clause += f" across {future_forecast_weeks} forecasted weeks"
+        baseline_clause += "."
+
+    remediation_clause = ""
+    if not _email_mentions_stockout_remediation(email_body) and affected_period:
+        remediation_clause = (
+            f" We recommend applying xout logic or a temporary article link for the affected period {affected_period}."
+        )
+    elif not _email_mentions_stockout_remediation(email_body):
+        remediation_clause = " We recommend applying xout logic or a temporary article link for the affected period."
+
+    if _email_mentions_stockout_context(email_body, state):
+        stockout_sentence = (baseline_clause + remediation_clause).strip()
+    else:
+        count = latest_streak.get("count")
+        start_week = str(latest_streak.get("start_week_id") or "").strip()
+        end_week = str(latest_streak.get("end_week_id") or "").strip()
+        range_text = f" from {start_week} to {end_week}" if start_week and end_week else ""
+        intro = (
+            f"We observed {count} consecutive zero-shipment weeks{range_text}."
+            if count
+            else "We observed a pre-pivot zero-shipment disruption."
+        )
+        stockout_sentence = f"{intro} {baseline_clause}{remediation_clause}".strip()
+
+    if not stockout_sentence:
+        return _compose_email_text(subject, email_body)
+
     if not email_body:
-        return stockout_sentence
-    return f"{email_body}\n\n{stockout_sentence}"
+        updated_body = stockout_sentence
+    else:
+        updated_body = f"{email_body}\n\n{stockout_sentence}"
+    return _compose_email_text(subject, updated_body)
 
 
 def _render_report(cinv: int, state: dict[str, Any], report_markdown: str) -> str:
@@ -491,13 +761,8 @@ def _render_report(cinv: int, state: dict[str, Any], report_markdown: str) -> st
 
 def _render_email(cinv: int, state: dict[str, Any], email_text: str) -> tuple[str, str]:
     subject = state.get("email_subject") or f"Forecast Review - {state.get('article_name') or f'CINV {cinv}'}"
-    body = email_text.strip()
-    subject_match = re.search(r"^Subject:\s*(.+)$", body, flags=re.MULTILINE)
-    if subject_match:
-        subject = subject_match.group(1).strip()
-        body = re.sub(r"^Subject:\s*.+$", "", body, count=1, flags=re.MULTILINE).strip()
-    body = re.sub(r"^Dear Client,\s*", "", body, count=1).strip()
-    body = re.sub(r"Kind regards,\s*DFAI Managed Services\s*$", "", body, flags=re.DOTALL).strip()
+    subject, body = _extract_email_parts(email_text, subject)
+    body = _build_structured_email_body(state, body)
     template = Template(EMAIL_TEMPLATE)
     rendered = template.render(
         article_name=state.get("article_name") or "Unknown Article",

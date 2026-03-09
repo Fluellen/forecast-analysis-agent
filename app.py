@@ -35,6 +35,7 @@ API_BASE = f"http://127.0.0.1:{API_PORT}"
 DISPLAY_TEXT_BATCH_CHARS = 1200
 DISPLAY_TOOL_ARGS_BATCH_CHARS = 600
 DISPLAY_RESULT_PREVIEW_CHARS = 360
+REQUEST_SELECTOR_PLACEHOLDER = "Select article from dropdown (optional)"
 
 TAB_NAMES = ["Chat", "Report", "Charts", "Logs", "Observability"]
 STEP_LABELS = {
@@ -104,6 +105,10 @@ def ensure_state() -> None:
         "event_queue": queue.Queue(),
         "analysis_thread": None,
         "selected_cinv": None,
+        "analysis_request_selector": REQUEST_SELECTOR_PLACEHOLDER,
+        "analysis_request_input": "",
+        "analysis_request_text": "",
+        "input_resolution": {},
         "force_weather": False,
         "error_message": "",
         "view_mode": "Analysis",
@@ -139,23 +144,37 @@ def reset_analysis_state() -> None:
     st.session_state.error_message = ""
     st.session_state.expanded_cards = set()
     st.session_state.expanded_log_row = None
+    st.session_state.input_resolution = {}
 
 
 # ===================================================================
 # STREAMING & EVENT HANDLING (preserved exactly)
 # ===================================================================
-def start_analysis(cinv: int, force_weather: bool) -> None:
+def _parse_direct_cinv_input(raw_text: str) -> int | None:
+    stripped = (raw_text or "").strip()
+    if re.fullmatch(r"\d+", stripped):
+        return int(stripped)
+    return None
+
+
+def start_analysis(request_text: str, force_weather: bool) -> None:
     reset_analysis_state()
     st.session_state.analysis_running = True
-    st.session_state.selected_cinv = cinv
+    st.session_state.analysis_request_text = request_text
+    st.session_state.selected_cinv = _parse_direct_cinv_input(request_text)
     st.session_state.force_weather = force_weather
-    worker = threading.Thread(target=_consume_stream, args=(st.session_state.event_queue, cinv, force_weather), daemon=True)
+    worker = threading.Thread(target=_consume_stream, args=(st.session_state.event_queue, request_text, force_weather), daemon=True)
     st.session_state.analysis_thread = worker
     worker.start()
 
 
-def _consume_stream(event_queue: queue.Queue[dict[str, Any]], cinv: int, force_weather: bool) -> None:
-    payload = {"cinv": int(cinv), "force_weather": bool(force_weather)}
+def _consume_stream(event_queue: queue.Queue[dict[str, Any]], request_text: str, force_weather: bool) -> None:
+    payload: dict[str, Any] = {"force_weather": bool(force_weather)}
+    direct_cinv = _parse_direct_cinv_input(request_text)
+    if direct_cinv is not None:
+        payload["cinv"] = direct_cinv
+    else:
+        payload["input_text"] = request_text
     try:
         with httpx.Client(timeout=None) as client:
             with client.stream("POST", f"{API_BASE}/api/run", json=payload, headers={"Accept": "text/event-stream"}) as response:
@@ -189,6 +208,8 @@ def handle_event(event: dict[str, Any]) -> None:
     st.session_state.agent_events.append(event)
 
     if event_type == "RUN_STARTED":
+        if event.get("cinv") is not None:
+            st.session_state.selected_cinv = int(event["cinv"])
         append_trace("system", "Run started", f"CINV {event.get('cinv', st.session_state.selected_cinv)}", "running")
     elif event_type == "STEP_STARTED":
         step_number = str(event.get("step_number"))
@@ -252,6 +273,12 @@ def apply_state_update(delta: dict[str, Any]) -> None:
     if not delta:
         return
     st.session_state.agent_state.update(delta)
+    if "selected_cinv" in delta and delta["selected_cinv"] is not None:
+        st.session_state.selected_cinv = int(delta["selected_cinv"])
+    if "input_request_text" in delta and delta["input_request_text"]:
+        st.session_state.analysis_request_text = str(delta["input_request_text"])
+    if "input_resolution" in delta and delta["input_resolution"]:
+        st.session_state.input_resolution = delta["input_resolution"]
     if delta.get("steps"):
         st.session_state.step_status.update(delta["steps"])
     if "report" in delta and delta["report"]:
@@ -1300,6 +1327,9 @@ def render_top_nav() -> None:
         context_text = f"CINV {cinv}"
         if article_name:
             context_text += f" &middot; {html.escape(str(article_name))}"
+    elif st.session_state.analysis_request_text and st.session_state.analysis_running:
+        snippet = st.session_state.analysis_request_text.strip().replace("\n", " ")
+        context_text = f"Resolving request &middot; {html.escape(snippet[:80])}"
 
     st.markdown(
         f'<div class="top-nav">'
@@ -1368,39 +1398,81 @@ def render_step_stepper() -> None:
 # ===================================================================
 # TAB 1: CHAT
 # ===================================================================
-def render_chat_tab(options: list[dict[str, Any]], selected_default_index: int) -> None:
+def render_chat_tab() -> None:
     has_run = st.session_state.analysis_running or any(s != "waiting" for s in st.session_state.step_status.values())
+    article_options = build_cinv_options()
+    article_lookup = {option["label"]: str(option["cinv"]) for option in article_options}
+    selector_value = st.session_state.get("analysis_request_selector", REQUEST_SELECTOR_PLACEHOLDER)
+    dropdown_selected = selector_value != REQUEST_SELECTOR_PLACEHOLDER
 
-    # --- If analysis is running, show compact bar instead of full input ---
-    if st.session_state.analysis_running:
-        cinv = st.session_state.selected_cinv or "?"
+    # Hide stale keyed widgets that Streamlit preserves from previous renders
+    if st.session_state.analysis_running or has_run:
         st.markdown(
-            f'<div class="running-bar"><div class="spinner"></div> Analysing CINV {html.escape(str(cinv))}...</div>',
+            '<style>'
+            '.st-key-analysis_request_input,'
+            '.st-key-analysis_request_selector,'
+            '.st-key-force_weather_checkbox,'
+            '.st-key-prompt_btn,'
+            '.st-key-run_btn{display:none!important}'
+            '</style>',
             unsafe_allow_html=True,
         )
-        bcol1, bcol2 = st.columns([1, 6])
+
+    # --- If analysis is running, show compact status bar + Reset ---
+    if st.session_state.analysis_running:
+        cinv = st.session_state.selected_cinv or "?"
+        running_text = f"Analysing CINV {html.escape(str(cinv))}..." if st.session_state.selected_cinv is not None else "Resolving article request and starting analysis..."
+        st.markdown(
+            f'<div class="running-bar"><div class="spinner"></div> {running_text}</div>',
+            unsafe_allow_html=True,
+        )
+        bcol1, bcol2, bcol3 = st.columns([1, 1, 4])
         with bcol1:
             if st.button("Reset", key="reset_running"):
                 reset_analysis_state()
                 st.rerun()
+        with bcol2:
+            if st.button("View System Prompt", key="prompt_btn_running"):
+                st.session_state["show_prompt"] = not st.session_state.get("show_prompt", False)
+                st.rerun()
+
+    # --- Post-run: hide input form, show only Reset ---
+    elif has_run:
+        bcol1, bcol2, bcol3 = st.columns([1, 1, 4])
+        with bcol1:
+            if st.button("Reset", width="stretch", key="reset_completed"):
+                reset_analysis_state()
+                st.rerun()
+        with bcol2:
+            if st.button("View System Prompt", width="stretch", key="prompt_btn_post"):
+                st.session_state["show_prompt"] = not st.session_state.get("show_prompt", False)
+                st.rerun()
+
+    # --- Fresh start: full input form ---
     else:
-        # --- Input card ---
         st.markdown(
             '<div class="card-title">Run Forecast Analysis</div>'
-            '<div class="card-subtitle">Select an article CINV and configure options before starting the agent.</div>',
+            '<div class="card-subtitle">Enter a direct CINV, choose an article from the dropdown, or paste a client email, Slack message, or support ticket. The backend will resolve the article automatically when needed.</div>',
             unsafe_allow_html=True,
         )
 
-        col_select, col_weather = st.columns([3, 1])
-        with col_select:
-            selection = st.selectbox(
-                "Article (CINV)",
-                options,
-                index=selected_default_index,
-                format_func=lambda o: o["label"],
-                key="cinv_selector",
+        input_col, weather_col = st.columns([3, 1])
+        with input_col:
+            st.selectbox(
+                "Quick Select",
+                options=[REQUEST_SELECTOR_PLACEHOLDER] + [option["label"] for option in article_options],
+                key="analysis_request_selector",
             )
-        with col_weather:
+            selector_value = st.session_state.get("analysis_request_selector", REQUEST_SELECTOR_PLACEHOLDER)
+            dropdown_selected = selector_value != REQUEST_SELECTOR_PLACEHOLDER
+            st.text_area(
+                "Article Request",
+                key="analysis_request_input",
+                height=140,
+                placeholder="Examples:\n111111\n\nPlease analyse Fresh Milk 1 l for the customer.\n\nClient email: The forecast for Fresh Milk 1 l looks wrong for the weeks after Christmas. Can you review it?",
+                disabled=dropdown_selected,
+            )
+        with weather_col:
             force_weather = st.checkbox(
                 "Force weather enrichment",
                 value=st.session_state.force_weather,
@@ -1411,17 +1483,20 @@ def render_chat_tab(options: list[dict[str, Any]], selected_default_index: int) 
         btn_col1, btn_col2, btn_col3, btn_col4 = st.columns([1, 1, 1, 3])
         with btn_col1:
             if st.button("Run Analysis", type="primary", width="stretch", key="run_btn"):
-                start_analysis(selection["cinv"], force_weather)
-                st.rerun()
+                request_text = ""
+                if dropdown_selected:
+                    request_text = article_lookup.get(selector_value, "")
+                else:
+                    request_text = st.session_state.analysis_request_input.strip()
+                if not request_text:
+                    st.session_state.error_message = "Enter a CINV, choose an article from the dropdown, or paste a request before starting the analysis."
+                else:
+                    start_analysis(request_text, force_weather)
+                    st.rerun()
         with btn_col2:
             if st.button("View System Prompt", width="stretch", key="prompt_btn"):
                 st.session_state["show_prompt"] = not st.session_state.get("show_prompt", False)
                 st.rerun()
-        with btn_col3:
-            if has_run:
-                if st.button("Reset", width="stretch", key="reset_completed"):
-                    reset_analysis_state()
-                    st.rerun()
 
     # --- System Prompt modal ---
     if st.session_state.get("show_prompt", False):
@@ -1448,6 +1523,16 @@ def render_chat_tab(options: list[dict[str, Any]], selected_default_index: int) 
     if run_error:
         st.markdown(
             f'<div class="banner-error">&#10005; {html.escape(st.session_state.error_message)}</div>',
+            unsafe_allow_html=True,
+        )
+
+    resolution = st.session_state.input_resolution or {}
+    if resolution.get("mode") == "llm_extracted" and resolution.get("cinv"):
+        article_name = resolution.get("article_name") or st.session_state.agent_state.get("article_name") or "resolved article"
+        confidence = str(resolution.get("confidence") or "medium").upper()
+        st.markdown(
+            f'<div class="banner-info">&#9432; Resolved your pasted request to <strong>CINV {html.escape(str(resolution["cinv"]))}</strong> '
+            f'({html.escape(str(article_name))}, confidence {html.escape(confidence)}).</div>',
             unsafe_allow_html=True,
         )
 
@@ -1510,7 +1595,7 @@ def render_chat_tab(options: list[dict[str, Any]], selected_default_index: int) 
         st.markdown(
             '<div class="empty-state">'
             '<div class="empty-state-icon">&#128640;</div>'
-            '<div class="empty-state-text">Select an article and click <strong>Run Analysis</strong> to start the agent.</div>'
+            '<div class="empty-state-text">Enter a CINV or paste a client request, then click <strong>Run Analysis</strong> to start the agent.</div>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -1835,7 +1920,7 @@ def render_observability_tab() -> None:
         '<div class="endpoint-body">'
         '<div class="endpoint-header"><span class="method-badge method-badge-post">POST</span>'
         '<span class="endpoint-path">/api/run</span></div>'
-        '<div class="endpoint-desc">Start a forecast analysis run. Accepts <code>{cinv: int}</code>. Returns AG-UI SSE event stream.</div>'
+        '<div class="endpoint-desc">Start a forecast analysis run. Accepts either <code>{cinv: int}</code> or <code>{input_text: string}</code>. Returns AG-UI SSE event stream.</div>'
         '</div></div>',
         unsafe_allow_html=True,
     )
@@ -1877,25 +1962,16 @@ def render_observability_tab() -> None:
 ensure_state()
 render_css()
 forecast_df, metadata_df, _links_df = load_data()
-options = build_cinv_options()
 drain_events()
 
 render_top_nav()
 render_tab_strip()
 
-# Resolve selected CINV default index for Chat tab
-selected_default_index = 0
-if st.session_state.selected_cinv is not None:
-    for index, option in enumerate(options):
-        if option["cinv"] == st.session_state.selected_cinv:
-            selected_default_index = index
-            break
-
 # --- Route to active tab ---
 active_tab = st.session_state["active_tab"]
 
 if active_tab == "Chat":
-    render_chat_tab(options, selected_default_index)
+    render_chat_tab()
 elif active_tab == "Report":
     render_report_tab()
 elif active_tab == "Charts":
