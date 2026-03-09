@@ -1369,6 +1369,8 @@ def render_step_stepper() -> None:
 # TAB 1: CHAT
 # ===================================================================
 def render_chat_tab(options: list[dict[str, Any]], selected_default_index: int) -> None:
+    has_run = st.session_state.analysis_running or any(s != "waiting" for s in st.session_state.step_status.values())
+
     # --- If analysis is running, show compact bar instead of full input ---
     if st.session_state.analysis_running:
         cinv = st.session_state.selected_cinv or "?"
@@ -1400,13 +1402,13 @@ def render_chat_tab(options: list[dict[str, Any]], selected_default_index: int) 
             )
         with col_weather:
             force_weather = st.checkbox(
-                "Weather enrichment",
+                "Force weather enrichment",
                 value=st.session_state.force_weather,
                 help="Force weather analysis even if the agent does not find strong weather-sensitivity evidence.",
                 key="force_weather_checkbox",
             )
 
-        btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 4])
+        btn_col1, btn_col2, btn_col3, btn_col4 = st.columns([1, 1, 1, 3])
         with btn_col1:
             if st.button("Run Analysis", type="primary", width="stretch", key="run_btn"):
                 start_analysis(selection["cinv"], force_weather)
@@ -1415,6 +1417,11 @@ def render_chat_tab(options: list[dict[str, Any]], selected_default_index: int) 
             if st.button("View System Prompt", width="stretch", key="prompt_btn"):
                 st.session_state["show_prompt"] = not st.session_state.get("show_prompt", False)
                 st.rerun()
+        with btn_col3:
+            if has_run:
+                if st.button("Reset", width="stretch", key="reset_completed"):
+                    reset_analysis_state()
+                    st.rerun()
 
     # --- System Prompt modal ---
     if st.session_state.get("show_prompt", False):
@@ -1425,7 +1432,6 @@ def render_chat_tab(options: list[dict[str, Any]], selected_default_index: int) 
         )
 
     # --- Step stepper (always visible once a run has started or is running) ---
-    has_run = st.session_state.analysis_running or any(s != "waiting" for s in st.session_state.step_status.values())
     if has_run:
         render_step_stepper()
 
