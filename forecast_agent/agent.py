@@ -172,7 +172,7 @@ class ForecastAnalysisAgent:
         self.last_state = state.copy()
 
         try:
-            state["stockout_risk"] = detect_pre_pivot_stockout_risk(cinv)
+            state["stockout_risk"] = json.loads(detect_pre_pivot_stockout_risk(cinv))
         except Exception:
             state["stockout_risk"] = {}
 
@@ -399,6 +399,11 @@ def _split_deliverables(text: str) -> tuple[str, str]:
 
 def _get_stockout_reporting_guidance(state: dict[str, Any]) -> tuple[str, float | None]:
     stockout_risk = state.get("stockout_risk") or {}
+    if isinstance(stockout_risk, str):
+        try:
+            stockout_risk = json.loads(stockout_risk)
+        except json.JSONDecodeError:
+            return "", None
     if not stockout_risk.get("stockout_risk_detected"):
         return "", None
 

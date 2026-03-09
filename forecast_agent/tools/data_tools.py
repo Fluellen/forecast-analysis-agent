@@ -15,7 +15,6 @@ from ..data_access import (
     get_article_links_frame,
     get_article_metadata_frame,
     normalize_for_json,
-    normalize_for_json,
 )
 
 
@@ -202,16 +201,25 @@ def detect_pre_pivot_stockout_risk(art_cinv: int) -> str:
         xout_adjusted_series = analysis_window["ACTUAL_DEMAND"].where(~zero_mask, xout_replacement_units)
         xout_adjusted_avg = float(xout_adjusted_series.mean())
 
-    pivot_row = frame[frame["MVT_DATE_DT"] >= pivot_ts].sort_values("MVT_DATE_DT").head(1)
+    future_horizon = frame[frame["MVT_DATE_DT"] >= pivot_ts].sort_values("MVT_DATE_DT").copy()
+    pivot_row = future_horizon.head(1)
     pivot_forecast = None
     pivot_moving_avg = None
     if not pivot_row.empty:
         pivot_forecast = normalize_for_json(pd.to_numeric(pivot_row.iloc[0]["FORECAST"], errors="coerce"))
         pivot_moving_avg = normalize_for_json(pd.to_numeric(pivot_row.iloc[0]["MOVING_AVG"], errors="coerce"))
 
+    future_forecast_values = pd.to_numeric(future_horizon["FORECAST"], errors="coerce").dropna()
+    future_forecast_weeks = int(len(future_forecast_values))
+    future_forecast_baseline_avg = float(future_forecast_values.mean()) if not future_forecast_values.empty else None
+    future_forecast_baseline_total = float(future_forecast_values.sum()) if not future_forecast_values.empty else None
+
     baseline_reduction_pct = None
-    if xout_adjusted_avg not in (None, 0) and pivot_forecast is not None:
-        baseline_reduction_pct = max(0.0, float((xout_adjusted_avg - float(pivot_forecast)) / xout_adjusted_avg * 100))
+    if xout_adjusted_avg not in (None, 0) and future_forecast_baseline_avg is not None:
+        baseline_reduction_pct = max(
+            0.0,
+            float((xout_adjusted_avg - future_forecast_baseline_avg) / xout_adjusted_avg * 100),
+        )
 
     stockout_risk_detected = bool(latest_streak and latest_streak["count"] >= 2 and baseline_reduction_pct is not None and baseline_reduction_pct >= 5)
     affected_period = _format_week_span(
@@ -231,10 +239,12 @@ def detect_pre_pivot_stockout_risk(art_cinv: int) -> str:
         )
 
     if stockout_risk_detected and latest_streak is not None:
+        adjusted_baseline = float(xout_adjusted_avg) if xout_adjusted_avg is not None else 0.0
+        future_baseline_avg = float(future_forecast_baseline_avg) if future_forecast_baseline_avg is not None else 0.0
         interpretation = (
             f"Article CINV {art_cinv} shows {latest_streak['count']} consecutive pre-pivot weeks with zero shipments from "
             f"{latest_streak['start_week_id']} to {latest_streak['end_week_id']}. This pattern is more consistent with a shortage, stockout, or underlying data issue than a true collapse in demand. "
-            f"Using a 13-week pre-pivot baseline window, replacing those zero weeks with xout demand estimates implies an adjusted baseline of about {xout_adjusted_avg:.2f} units, versus a pivot-week forecast baseline of {float(pivot_forecast):.2f} units. "
+            f"Using a 13-week pre-pivot baseline window, replacing those zero weeks with xout demand estimates implies an adjusted baseline of about {adjusted_baseline:.2f} units, versus an average future forecast baseline of {future_baseline_avg:.2f} units across {future_forecast_weeks} forecasted weeks. "
             f"That means the future baseline may be artificially lowered by about {baseline_reduction_pct:.2f}%."
         )
     elif latest_streak is not None:
@@ -250,7 +260,7 @@ def detect_pre_pivot_stockout_risk(art_cinv: int) -> str:
         reporting_guidance = (
             f"For article CINV {art_cinv}, I identified {latest_streak['count']} consecutive weeks of zero shipments before the pivot "
             f"({latest_streak['start_week_id']} to {latest_streak['end_week_id']}). This pattern suggests a stockout, shortage, or underlying data issue, "
-            f"which artificially lowers the forecast baseline by approximately {baseline_reduction_pct:.2f}%. "
+            f"which artificially lowers the average future forecast baseline by approximately {baseline_reduction_pct:.2f}% across {future_forecast_weeks} forecasted weeks. "
             f"The recommended solution is to either apply the xout logic or create an article link for the affected period {affected_period}."
         )
 
@@ -269,6 +279,9 @@ def detect_pre_pivot_stockout_risk(art_cinv: int) -> str:
             "xout_adjusted_window_avg_demand": round(xout_adjusted_avg, 2) if xout_adjusted_avg is not None else None,
             "pivot_forecast_baseline": round(float(pivot_forecast), 2) if pivot_forecast is not None else None,
             "pivot_moving_avg_baseline": round(float(pivot_moving_avg), 2) if pivot_moving_avg is not None else None,
+            "future_forecast_weeks": future_forecast_weeks,
+            "future_forecast_baseline_avg": round(future_forecast_baseline_avg, 2) if future_forecast_baseline_avg is not None else None,
+            "future_forecast_baseline_total": round(future_forecast_baseline_total, 2) if future_forecast_baseline_total is not None else None,
             "baseline_reduction_pct": round(baseline_reduction_pct, 2) if baseline_reduction_pct is not None else None,
             "existing_link_rows": existing_link_rows,
             "possible_causes": ["stockout_or_shortage", "underlying_data_issue"] if latest_streak is not None else [],
