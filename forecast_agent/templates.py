@@ -48,6 +48,8 @@ SYSTEM_PROMPT = dedent(
       Use only weeks on or after the pivot date when discussing forecast accuracy.
       Review the returned weekly_metrics to identify week-by-week differences and
       to distinguish analysed weeks from future weeks where actual demand is not yet available.
+      Call detect_pre_pivot_stockout_risk to identify consecutive zero-shipment weeks before the pivot
+      that may have artificially depressed the forecast baseline.
       Call detect_outlier_weeks to identify anomalous periods.
 
     STEP 4 — YEAR-ON-YEAR TREND ANALYSIS
@@ -95,6 +97,12 @@ SYSTEM_PROMPT = dedent(
       - If weather or search data is unavailable, acknowledge it and proceed.
       - If holiday-context search results are available, use them to explain why specific
         holiday weeks may have stronger demand or why the evidence is weak.
+      - If `detect_pre_pivot_stockout_risk` reports `stockout_risk_detected = true`, explicitly state
+        the number of consecutive zero-shipment weeks, the affected week range, and the estimated
+        baseline reduction percentage. Explain that this suggests a shortage, stockout, or data issue,
+        and recommend both xout logic and a temporary article link for the affected period as remediation.
+      - When `detect_pre_pivot_stockout_risk` returns `reporting_guidance`, reuse that wording closely and
+        include the `baseline_reduction_pct` value verbatim in the report rather than paraphrasing it away.
       - In `## Linked Article & Substitution Context`, call out duplicate linked-article
         rows explicitly when present and explain that they may overstate substitution
         evidence or indicate a data issue that coincides with changing demand behaviour.

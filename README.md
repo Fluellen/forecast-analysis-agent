@@ -8,6 +8,7 @@ This project analyzes a selected article CINV from the CSV datasets in [data/for
 
 - identifies the article and related metadata
 - evaluates forecast health and outlier weeks
+- detects pre-pivot zero-shipment streaks that can depress the future forecast baseline
 - compares demand against NM1, NM2, and NM3 baselines
 - optionally enriches the run with weather context for Dublin
 - drafts a planner report and a client-facing email
@@ -157,6 +158,7 @@ python run_agent.py --cinv 4685056 --force-weather --json
 | `get_forecast_data` | Load weekly forecast rows from `forecast_data.csv` |
 | `get_article_links` | Load linked article relationships from `links.csv` |
 | `compute_forecast_health` | Compute pivot-horizon MAPE/WAPE, bias, tracking signal, and weekly forecast accuracy detail |
+| `detect_pre_pivot_stockout_risk` | Detect consecutive zero-shipment weeks before the pivot, estimate baseline depression, and recommend xout or article-link remediation |
 | `detect_outlier_weeks` | Flag IQR and z-score outlier weeks |
 | `analyse_year_on_year_trend` | Compare demand against NM1, NM2, and NM3 baselines |
 | `get_article_links_demand` | Summarize linked article demand, highlight duplicate link rows, and frame substitution context |

@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from scipy import stats
 
 from ..data_access import (
@@ -91,6 +92,189 @@ def get_article_links(art_cinv: int) -> str:
             "art_cinv": int(art_cinv),
             "links": records,
             "count": len(records),
+        }
+    )
+
+
+def _split_week_id(week_id: str | None) -> tuple[int | None, int | None]:
+    if not week_id or "-W" not in week_id:
+        return None, None
+    raw_year, raw_week = week_id.split("-W", maxsplit=1)
+    try:
+        return int(raw_year), int(raw_week)
+    except ValueError:
+        return None, None
+
+
+def _format_week_span(start_week_id: str | None, end_week_id: str | None) -> str | None:
+    if not start_week_id or not end_week_id:
+        return None
+    if start_week_id == end_week_id:
+        return start_week_id
+    start_year, start_week = _split_week_id(start_week_id)
+    end_year, end_week = _split_week_id(end_week_id)
+    if start_year is not None and end_year is not None and start_year == end_year and start_week is not None and end_week is not None:
+        return f"weeks {start_week}-{end_week} of {start_year}"
+    return f"{start_week_id} to {end_week_id}"
+
+
+def detect_pre_pivot_stockout_risk(art_cinv: int) -> str:
+    """Detect zero-shipment streaks before the pivot that can depress the future forecast baseline."""
+    frame = get_article_forecast_frame(int(art_cinv)).copy()
+
+    if frame.empty:
+        return _json(
+            {
+                "art_cinv": int(art_cinv),
+                "stockout_risk_detected": False,
+                "analysis_window_weeks": 0,
+                "zero_shipment_weeks_in_window": 0,
+                "latest_zero_shipment_streak": None,
+                "baseline_reduction_pct": None,
+                "interpretation": "No forecast rows were available, so no pre-pivot stockout assessment could be made.",
+                "recommended_actions": [],
+            }
+        )
+
+    pivot_candidates = frame.get("PIVOT_DATE_DT")
+    if pivot_candidates is None or pivot_candidates.dropna().empty:
+        return _json(
+            {
+                "art_cinv": int(art_cinv),
+                "stockout_risk_detected": False,
+                "analysis_window_weeks": 0,
+                "zero_shipment_weeks_in_window": 0,
+                "latest_zero_shipment_streak": None,
+                "baseline_reduction_pct": None,
+                "interpretation": "The article has no pivot date, so no pre-pivot stockout assessment could be made.",
+                "recommended_actions": [],
+            }
+        )
+
+    pivot_ts = pivot_candidates.dropna().iloc[-1]
+    pre_pivot = frame[frame["MVT_DATE_DT"] < pivot_ts].sort_values("MVT_DATE_DT").copy()
+    if pre_pivot.empty:
+        return _json(
+            {
+                "art_cinv": int(art_cinv),
+                "stockout_risk_detected": False,
+                "analysis_window_weeks": 0,
+                "zero_shipment_weeks_in_window": 0,
+                "latest_zero_shipment_streak": None,
+                "baseline_reduction_pct": None,
+                "interpretation": "There are no pre-pivot weeks available for stockout assessment.",
+                "recommended_actions": [],
+            }
+        )
+
+    analysis_window = pre_pivot.tail(13).copy()
+    analysis_window["ACTUAL_DEMAND"] = pd.to_numeric(analysis_window["ACTUAL_DEMAND"], errors="coerce").fillna(0.0)
+    analysis_window["FORECAST"] = pd.to_numeric(analysis_window["FORECAST"], errors="coerce")
+    analysis_window["MOVING_AVG"] = pd.to_numeric(analysis_window["MOVING_AVG"], errors="coerce")
+
+    zero_mask = analysis_window["ACTUAL_DEMAND"].eq(0)
+    zero_shipment_weeks = analysis_window.loc[zero_mask, "WEEK_ID"].astype(str).tolist()
+
+    streak_groups = zero_mask.ne(zero_mask.shift(fill_value=False)).cumsum()
+    streaks: list[dict[str, Any]] = []
+    for _, streak_frame in analysis_window.groupby(streak_groups):
+        if not bool(streak_frame["ACTUAL_DEMAND"].eq(0).all()):
+            continue
+        first_row = streak_frame.iloc[0]
+        last_row = streak_frame.iloc[-1]
+        streaks.append(
+            {
+                "count": int(len(streak_frame)),
+                "start_week_id": str(first_row["WEEK_ID"]),
+                "end_week_id": str(last_row["WEEK_ID"]),
+                "start_date": normalize_for_json(first_row["MVT_DATE_DT"]),
+                "end_date": normalize_for_json(last_row["MVT_DATE_DT"]),
+                "week_ids": streak_frame["WEEK_ID"].astype(str).tolist(),
+            }
+        )
+
+    latest_streak = streaks[-1] if streaks else None
+    recent_non_zero = analysis_window.loc[analysis_window["ACTUAL_DEMAND"] > 0, "ACTUAL_DEMAND"]
+    observed_avg = float(analysis_window["ACTUAL_DEMAND"].mean()) if not analysis_window.empty else None
+    xout_replacement_units = float(recent_non_zero.mean()) if not recent_non_zero.empty else None
+    xout_adjusted_avg = None
+    if xout_replacement_units is not None:
+        xout_adjusted_series = analysis_window["ACTUAL_DEMAND"].where(~zero_mask, xout_replacement_units)
+        xout_adjusted_avg = float(xout_adjusted_series.mean())
+
+    pivot_row = frame[frame["MVT_DATE_DT"] >= pivot_ts].sort_values("MVT_DATE_DT").head(1)
+    pivot_forecast = None
+    pivot_moving_avg = None
+    if not pivot_row.empty:
+        pivot_forecast = normalize_for_json(pd.to_numeric(pivot_row.iloc[0]["FORECAST"], errors="coerce"))
+        pivot_moving_avg = normalize_for_json(pd.to_numeric(pivot_row.iloc[0]["MOVING_AVG"], errors="coerce"))
+
+    baseline_reduction_pct = None
+    if xout_adjusted_avg not in (None, 0) and pivot_forecast is not None:
+        baseline_reduction_pct = max(0.0, float((xout_adjusted_avg - float(pivot_forecast)) / xout_adjusted_avg * 100))
+
+    stockout_risk_detected = bool(latest_streak and latest_streak["count"] >= 2 and baseline_reduction_pct is not None and baseline_reduction_pct >= 5)
+    affected_period = _format_week_span(
+        latest_streak.get("start_week_id") if latest_streak else None,
+        latest_streak.get("end_week_id") if latest_streak else None,
+    )
+    existing_link_rows = int(len(get_article_links_frame(int(art_cinv))))
+
+    recommended_actions: list[str] = []
+    if stockout_risk_detected and latest_streak is not None:
+        if xout_replacement_units is not None:
+            recommended_actions.append(
+                f"Apply xout logic to replace the zero-shipment weeks in {affected_period or latest_streak['start_week_id']} with an estimated demand of about {xout_replacement_units:.0f} units per week when rebuilding the baseline."
+            )
+        recommended_actions.append(
+            f"Create or extend an article link for {affected_period or latest_streak['start_week_id']} so the baseline can borrow demand from a similar article during the affected period."
+        )
+
+    if stockout_risk_detected and latest_streak is not None:
+        interpretation = (
+            f"Article CINV {art_cinv} shows {latest_streak['count']} consecutive pre-pivot weeks with zero shipments from "
+            f"{latest_streak['start_week_id']} to {latest_streak['end_week_id']}. This pattern is more consistent with a shortage, stockout, or underlying data issue than a true collapse in demand. "
+            f"Using a 13-week pre-pivot baseline window, replacing those zero weeks with xout demand estimates implies an adjusted baseline of about {xout_adjusted_avg:.2f} units, versus a pivot-week forecast baseline of {float(pivot_forecast):.2f} units. "
+            f"That means the future baseline may be artificially lowered by about {baseline_reduction_pct:.2f}%."
+        )
+    elif latest_streak is not None:
+        interpretation = (
+            f"Article CINV {art_cinv} contains a pre-pivot zero-shipment streak, but the measured baseline distortion did not exceed the alert threshold. "
+            f"The latest streak covered {latest_streak['count']} weeks from {latest_streak['start_week_id']} to {latest_streak['end_week_id']}."
+        )
+    else:
+        interpretation = f"No material pre-pivot zero-shipment streaks were detected for article CINV {art_cinv}."
+
+    reporting_guidance = None
+    if stockout_risk_detected and latest_streak is not None and baseline_reduction_pct is not None:
+        reporting_guidance = (
+            f"For article CINV {art_cinv}, I identified {latest_streak['count']} consecutive weeks of zero shipments before the pivot "
+            f"({latest_streak['start_week_id']} to {latest_streak['end_week_id']}). This pattern suggests a stockout, shortage, or underlying data issue, "
+            f"which artificially lowers the forecast baseline by approximately {baseline_reduction_pct:.2f}%. "
+            f"The recommended solution is to either apply the xout logic or create an article link for the affected period {affected_period}."
+        )
+
+    return _json(
+        {
+            "art_cinv": int(art_cinv),
+            "pivot_date": normalize_for_json(pivot_ts),
+            "analysis_window_weeks": int(len(analysis_window)),
+            "zero_shipment_weeks_in_window": int(zero_mask.sum()),
+            "zero_shipment_week_ids": zero_shipment_weeks,
+            "latest_zero_shipment_streak": latest_streak,
+            "stockout_risk_detected": stockout_risk_detected,
+            "affected_period": affected_period,
+            "observed_window_avg_demand": round(observed_avg, 2) if observed_avg is not None else None,
+            "xout_replacement_units": round(xout_replacement_units, 2) if xout_replacement_units is not None else None,
+            "xout_adjusted_window_avg_demand": round(xout_adjusted_avg, 2) if xout_adjusted_avg is not None else None,
+            "pivot_forecast_baseline": round(float(pivot_forecast), 2) if pivot_forecast is not None else None,
+            "pivot_moving_avg_baseline": round(float(pivot_moving_avg), 2) if pivot_moving_avg is not None else None,
+            "baseline_reduction_pct": round(baseline_reduction_pct, 2) if baseline_reduction_pct is not None else None,
+            "existing_link_rows": existing_link_rows,
+            "possible_causes": ["stockout_or_shortage", "underlying_data_issue"] if latest_streak is not None else [],
+            "recommended_actions": recommended_actions,
+            "reporting_guidance": reporting_guidance,
+            "interpretation": interpretation,
         }
     )
 

@@ -209,7 +209,8 @@ def handle_event(event: dict[str, Any]) -> None:
         append_trace("step", event.get("step_name", "Step started"), "In progress", "running")
     elif event_type == "STEP_FINISHED":
         step_number = str(event.get("step_number"))
-        st.session_state.step_status[step_number] = "completed"
+        if st.session_state.step_status.get(step_number) != "skipped":
+            st.session_state.step_status[step_number] = "completed"
         append_trace("step", event.get("step_name", "Step finished"), "Completed", "done")
     elif event_type in {"TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_CHUNK"}:
         st.session_state.report_stream += event.get("delta", "")
@@ -797,22 +798,22 @@ def render_css() -> None:
             position: relative;
         }
         .step-circle {
-            width: 24px; height: 24px;
+            width: 36px; height: 36px;
             border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 11px;
-            font-weight: 600;
+            font-size: 15px;
+            font-weight: 700;
             z-index: 2;
         }
         .step-circle-waiting {
-            border: 2px solid #E4E8EF;
+            border: 2.5px solid #E4E8EF;
             background: #FFFFFF;
             color: #9CA3AF;
         }
         .step-circle-in_progress {
-            border: 2px solid var(--amber);
+            border: 2.5px solid var(--amber);
             background: #FFF8E6;
             color: var(--amber);
             animation: pulse-step 1.5s infinite;
@@ -822,26 +823,33 @@ def render_css() -> None:
             border: none;
             color: #FFFFFF;
         }
+        .step-circle-skipped {
+            background: var(--orange);
+            border: none;
+            color: #FFFFFF;
+        }
         .step-circle-error {
             background: var(--orange);
             border: none;
             color: #FFFFFF;
         }
         .step-label {
-            font-size: 11px;
-            margin-top: 6px;
+            font-size: 13px;
+            margin-top: 8px;
             text-align: center;
-            max-width: 90px;
+            max-width: 110px;
+            font-weight: 500;
         }
         .step-label-waiting, .step-label-completed { color: var(--gray-500); }
-        .step-label-in_progress { color: var(--ink); font-weight: 500; }
-        .step-label-error { color: var(--orange); font-weight: 500; }
+        .step-label-in_progress { color: var(--ink); font-weight: 600; }
+        .step-label-skipped { color: var(--orange); font-weight: 600; }
+        .step-label-error { color: var(--orange); font-weight: 600; }
         .step-connector {
             position: absolute;
-            top: 12px;
-            left: calc(50% + 12px);
-            right: calc(-50% + 12px);
-            height: 2px;
+            top: 18px;
+            left: calc(50% + 18px);
+            right: calc(-50% + 18px);
+            height: 3px;
             background: #E4E8EF;
             z-index: 1;
         }
@@ -851,7 +859,7 @@ def render_css() -> None:
 
         @keyframes pulse-step {
             0%, 100% { box-shadow: 0 0 0 0 rgba(255, 182, 0, 0.3); }
-            50% { box-shadow: 0 0 0 6px rgba(255, 182, 0, 0); }
+            50% { box-shadow: 0 0 0 8px rgba(255, 182, 0, 0); }
         }
 
         /* ---- Tool call cards (DevUI-style) ---- */
@@ -1202,7 +1210,14 @@ def render_css() -> None:
             border-color: var(--blue) !important;
             box-shadow: 0 0 0 2px rgba(0,116,232,0.15) !important;
         }
+        .stTextArea textarea {
+            background: #FFFFFF !important;
+            border: 1.5px solid var(--gray-300) !important;
+            border-radius: var(--radius-input) !important;
+        }
         .stCheckbox { font-size: 14px; }
+        /* Vertically align weather toggle with selectbox */
+        .stCheckbox { padding-top: 28px; }
 
         /* ---- Content spacer for fixed nav ---- */
         .nav-spacer { height: 18px; }
@@ -1312,6 +1327,8 @@ def render_step_stepper() -> None:
         status = st.session_state.step_status.get(key, "waiting")
         if status == "completed":
             circle_content = "&#10003;"
+        elif status == "skipped":
+            circle_content = "&#10005;"
         elif status == "error":
             circle_content = "&#10005;"
         else:
@@ -1319,7 +1336,7 @@ def render_step_stepper() -> None:
         connector = ""
         if i < len(step_keys) - 1:
             next_status = st.session_state.step_status.get(step_keys[i + 1], "waiting")
-            conn_cls = "step-connector-active" if status == "completed" and next_status != "waiting" else ""
+            conn_cls = "step-connector-active" if status in ("completed", "skipped") and next_status != "waiting" else ""
             connector = f'<div class="step-connector {conn_cls}"></div>'
         parts.append(
             f'<div class="step-item">{connector}'
@@ -1505,7 +1522,7 @@ def render_report_tab() -> None:
             for section in sections or [report_md]:
                 heading_match = re.match(r"##\s+(.+)", section)
                 if heading_match:
-                    st.markdown(f"## {heading_match.group(1).strip()}")
+                    st.markdown(f"### {heading_match.group(1).strip()}")
                     body = section[heading_match.end():].strip()
                 else:
                     body = section
@@ -1526,7 +1543,8 @@ def render_report_tab() -> None:
             st.markdown('<div class="card-title">Email Draft</div>', unsafe_allow_html=True)
             if email_subject:
                 st.markdown(f"**Subject:** {email_subject}")
-            st.text_area("Email body", email_draft, height=280, key="email_area", label_visibility="collapsed")
+            display_body = re.sub(r"^Subject:\s*.+$", "", email_draft, count=1, flags=re.MULTILINE).strip()
+            st.text_area("Email body", display_body, height=280, key="email_area", label_visibility="collapsed")
 
     with right:
         # --- Actions panel (sticky) ---

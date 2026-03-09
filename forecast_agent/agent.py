@@ -39,7 +39,7 @@ from .events import (
     tool_call_start,
 )
 from .templates import EMAIL_TEMPLATE, REPORT_TEMPLATE, SYSTEM_PROMPT, build_run_prompt
-from .tools import ALL_TOOLS
+from .tools import ALL_TOOLS, detect_pre_pivot_stockout_risk
 
 console = Console()
 
@@ -60,6 +60,7 @@ TOOL_TO_STEP = {
     "get_article_links_demand": 2,
     "search_holiday_demand_correlation": 2,
     "compute_forecast_health": 3,
+    "detect_pre_pivot_stockout_risk": 3,
     "detect_outlier_weeks": 3,
     "analyse_year_on_year_trend": 4,
     "correlate_weather_with_demand": 5,
@@ -161,6 +162,7 @@ class ForecastAnalysisAgent:
             "weather_enrichment_recommended": False,
             "weather_enrichment_activated": False,
             "weather_weeks": [],
+            "stockout_risk": {},
             "steps": step_state.copy(),
             "force_weather": bool(force_weather),
             "run_id": run_id,
@@ -168,6 +170,11 @@ class ForecastAnalysisAgent:
             "output_files": {},
         }
         self.last_state = state.copy()
+
+        try:
+            state["stockout_risk"] = detect_pre_pivot_stockout_risk(cinv)
+        except Exception:
+            state["stockout_risk"] = {}
 
         def update_state(**updates: Any) -> AGUIEvent:
             state.update(updates)
@@ -200,6 +207,8 @@ class ForecastAnalysisAgent:
                 state["weather_enrichment_recommended"] = bool(payload.get("weather_enrichment_recommended"))
             elif tool_name == "get_forecast_data":
                 state["pivot_date"] = payload.get("pivot_date") or state["pivot_date"]
+            elif tool_name == "detect_pre_pivot_stockout_risk":
+                state["stockout_risk"] = payload
             elif tool_name == "detect_outlier_weeks":
                 flagged = []
                 for item in payload.get("outliers", [])[:12]:
@@ -309,6 +318,7 @@ class ForecastAnalysisAgent:
                             category=state.get("category", ""),
                             pivot_date=state.get("pivot_date", ""),
                             flagged_weeks=state.get("flagged_weeks", []),
+                            stockout_risk=state.get("stockout_risk", {}),
                             weather_sensitivity=state.get("weather_sensitivity", {}),
                             weather_enrichment_recommended=state.get("weather_enrichment_recommended", False),
                             weather_enrichment_activated=state.get("weather_enrichment_activated", False),
@@ -334,13 +344,18 @@ class ForecastAnalysisAgent:
                 yield text_message_end(active_message_id)
 
             report_markdown, email_text = _split_deliverables(final_text)
+            report_markdown = _ensure_stockout_guidance_in_report(report_markdown, state)
+            email_text = _ensure_stockout_guidance_in_email(email_text, state)
             rendered_email, email_subject = _render_email(cinv, state, email_text)
             rendered_report = _render_report(cinv, state, report_markdown)
             output_paths = _save_outputs(output_prefix, rendered_report, rendered_email)
 
             for step_number in range(1, 7):
                 if step_state[str(step_number)] != "completed":
-                    step_state[str(step_number)] = "completed"
+                    if step_number == 5 and not state.get("weather_enrichment_activated"):
+                        step_state[str(step_number)] = "skipped"
+                    else:
+                        step_state[str(step_number)] = "completed"
                     yield step_finished(STEP_NAMES[step_number], step_number)
 
             yield update_state(
@@ -351,6 +366,7 @@ class ForecastAnalysisAgent:
                 email_subject=email_subject,
                 output_files=output_paths,
                 flagged_weeks=state.get("flagged_weeks", []),
+                stockout_risk=state.get("stockout_risk", {}),
             )
             yield state_snapshot(state.copy())
             console.log(f"Saved outputs to {output_paths['report']} and {output_paths['email']}")
@@ -379,6 +395,65 @@ def _split_deliverables(text: str) -> tuple[str, str]:
     report = report_match.group(1).strip() if report_match else text.strip()
     email = email_match.group(1).strip() if email_match else ""
     return report, email
+
+
+def _get_stockout_reporting_guidance(state: dict[str, Any]) -> tuple[str, float | None]:
+    stockout_risk = state.get("stockout_risk") or {}
+    if not stockout_risk.get("stockout_risk_detected"):
+        return "", None
+
+    guidance = str(stockout_risk.get("reporting_guidance") or "").strip()
+    pct = stockout_risk.get("baseline_reduction_pct")
+    try:
+        baseline_pct = float(pct) if pct is not None else None
+    except (TypeError, ValueError):
+        baseline_pct = None
+    return guidance, baseline_pct
+
+
+def _text_mentions_baseline_reduction(text: str, baseline_pct: float | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    if baseline_pct is None:
+        return "baseline" in lowered and ("reduction" in lowered or "lower" in lowered)
+
+    pct_variants = {
+        f"{baseline_pct:.1f}%",
+        f"{baseline_pct:.2f}%",
+        f"{baseline_pct:g}%",
+    }
+    return any(variant in text for variant in pct_variants)
+
+
+def _insert_after_section(markdown: str, section_header: str, block: str) -> str:
+    pattern = rf"(^##\s+{re.escape(section_header)}\s*$)"
+    match = re.search(pattern, markdown, flags=re.MULTILINE)
+    if not match:
+        return markdown.rstrip() + f"\n\n## {section_header}\n{block.strip()}\n"
+
+    insert_at = match.end()
+    return markdown[:insert_at] + f"\n{block.strip()}" + markdown[insert_at:]
+
+
+def _ensure_stockout_guidance_in_report(report_markdown: str, state: dict[str, Any]) -> str:
+    guidance, baseline_pct = _get_stockout_reporting_guidance(state)
+    if not guidance or _text_mentions_baseline_reduction(report_markdown, baseline_pct):
+        return report_markdown
+
+    return _insert_after_section(report_markdown, "Data Quality & Recommendations", guidance)
+
+
+def _ensure_stockout_guidance_in_email(email_text: str, state: dict[str, Any]) -> str:
+    guidance, baseline_pct = _get_stockout_reporting_guidance(state)
+    if not guidance or _text_mentions_baseline_reduction(email_text, baseline_pct):
+        return email_text
+
+    stockout_sentence = guidance.replace("The recommended solution is to either ", "DFAI recommends that we either ")
+    email_body = email_text.strip()
+    if not email_body:
+        return stockout_sentence
+    return f"{email_body}\n\n{stockout_sentence}"
 
 
 def _render_report(cinv: int, state: dict[str, Any], report_markdown: str) -> str:
