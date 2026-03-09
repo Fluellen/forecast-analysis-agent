@@ -7,16 +7,10 @@ import re
 from textwrap import dedent
 from typing import Any
 
-from azure.identity import DefaultAzureCredential
-
 from agent_framework import AgentResponseUpdate
-from agent_framework.azure import AzureOpenAIResponsesClient
-from agent_framework.openai import OpenAIResponsesClient
 
-from . import config
 from .data_access import list_available_articles
-
-_RESPONSES_CLIENT: AzureOpenAIResponsesClient | OpenAIResponsesClient | None = None
+from .responses_client import get_responses_client
 
 _RESOLUTION_SYSTEM_PROMPT = dedent(
     """
@@ -32,58 +26,6 @@ _RESOLUTION_SYSTEM_PROMPT = dedent(
     - Do not return markdown, commentary, or code fences.
     """
 ).strip()
-
-
-def _normalize_openai_base_url(base_url: str) -> str:
-    base_url = (base_url or "").strip().strip('"').strip("'")
-    if not base_url:
-        return ""
-    return base_url if base_url.endswith("/") else f"{base_url}/"
-
-
-def _build_client() -> AzureOpenAIResponsesClient | OpenAIResponsesClient:
-    global _RESPONSES_CLIENT
-    if _RESPONSES_CLIENT is not None:
-        return _RESPONSES_CLIENT
-
-    azure_openai_base_url = _normalize_openai_base_url(config.AZURE_OPENAI_ENDPOINT)
-    if azure_openai_base_url and config.AZURE_OPENAI_API_KEY and config.AZURE_OPENAI_MODEL_ID:
-        _RESPONSES_CLIENT = OpenAIResponsesClient(
-            base_url=azure_openai_base_url,
-            api_key=config.AZURE_OPENAI_API_KEY,
-            model_id=config.AZURE_OPENAI_MODEL_ID,
-        )
-        return _RESPONSES_CLIENT
-
-    if config.OPENAI_BASE_URL and config.OPENAI_API_KEY and config.OPENAI_RESPONSES_MODEL_ID:
-        _RESPONSES_CLIENT = OpenAIResponsesClient(
-            base_url=_normalize_openai_base_url(config.OPENAI_BASE_URL),
-            api_key=config.OPENAI_API_KEY,
-            model_id=config.OPENAI_RESPONSES_MODEL_ID,
-        )
-        return _RESPONSES_CLIENT
-
-    if config.AZURE_AI_PROJECT_ENDPOINT and config.AZURE_OPENAI_MODEL_ID:
-        _RESPONSES_CLIENT = AzureOpenAIResponsesClient(
-            project_endpoint=config.AZURE_AI_PROJECT_ENDPOINT,
-            deployment_name=config.AZURE_OPENAI_MODEL_ID,
-            credential=DefaultAzureCredential(exclude_interactive_browser_credential=False),
-        )
-        return _RESPONSES_CLIENT
-
-    if config.OPENAI_API_KEY and config.OPENAI_RESPONSES_MODEL_ID:
-        _RESPONSES_CLIENT = OpenAIResponsesClient(
-            api_key=config.OPENAI_API_KEY,
-            model_id=config.OPENAI_RESPONSES_MODEL_ID,
-        )
-        return _RESPONSES_CLIENT
-
-    raise RuntimeError(
-        "No supported model configuration is available for CINV extraction. Configure Azure AI project variables, "
-        "Azure OpenAI API key variables, or direct OpenAI responses variables."
-    )
-
-
 def _extract_direct_cinv(text: str) -> int | None:
     stripped = (text or "").strip()
     if re.fullmatch(r"\d+", stripped):
@@ -134,7 +76,7 @@ async def resolve_analysis_request(*, cinv: Any = None, input_text: str | None =
             "input_text": raw_text,
         }
 
-    client = _build_client()
+    client = get_responses_client()
     agent = client.as_agent(
         name="CinvResolutionAgent",
         instructions=_RESOLUTION_SYSTEM_PROMPT,

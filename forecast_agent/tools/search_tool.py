@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from functools import lru_cache
+from textwrap import dedent
 from typing import Any
 
+from agent_framework import AgentResponseUpdate
 from tavily import TavilyClient
 
 from .. import config
 from ..data_access import get_article_forecast_frame, get_article_metadata_frame, normalize_for_json
+from ..responses_client import get_responses_client
 
 SEARCH_SUFFIX = "supply chain seasonality demand drivers Ireland retail"
 
@@ -125,6 +129,46 @@ HOLIDAY_DEMAND_NEGATIVE_SIGNALS = {
     "lower demand": 3,
 }
 
+_WEATHER_DECISION_SYSTEM_PROMPT = dedent(
+        """
+        You decide whether weather enrichment should run for a retail demand forecast analysis.
+
+        Return JSON only using this schema exactly:
+        {
+            "schema_version": "weather_decision_v2",
+            "classification": "likely" | "possible" | "unlikely",
+            "recommended": <true|false>,
+            "confidence": "high" | "medium" | "low",
+            "demand_effect": "positive" | "negative" | "mixed" | "none" | "unclear",
+            "evidence_summary": <string>,
+            "rationale": <string>,
+            "matched_signals": [<string>, ...],
+            "blocking_signals": [<string>, ...],
+            "supporting_evidence": [<string>, ...]
+        }
+
+        Requirements:
+        - All fields are required.
+        - Arrays must contain short plain-text strings only.
+        - `recommended` may be true only when classification is "likely".
+        - If `recommended` is true, confidence must be "high" or "medium", demand_effect cannot be "none" or "unclear", and supporting_evidence must not be empty.
+        - If evidence is mixed or weak, use classification "possible" and recommended false.
+        - If evidence is absent or points away from weather-driven demand, use classification "unlikely" and recommended false.
+
+        Decision rules:
+        - Recommend weather enrichment only when customer demand itself is materially affected by weather.
+        - Do not recommend weather enrichment for staple or household products when the evidence only shows generic seasonality, storms, or operational disruption.
+        - Generic mentions of weather, seasons, or disruption are insufficient without a plausible demand effect.
+        - Use only the supplied context and evidence. Do not invent facts.
+        - Do not wrap the JSON in markdown.
+        """
+).strip()
+
+_WEATHER_DECISION_SCHEMA_VERSION = "weather_decision_v2"
+_WEATHER_CLASSIFICATIONS = {"likely", "possible", "unlikely"}
+_WEATHER_CONFIDENCE_LEVELS = {"high", "medium", "low"}
+_WEATHER_DEMAND_EFFECTS = {"positive", "negative", "mixed", "none", "unclear"}
+
 
 def _extract_cinv_candidates(query: str) -> list[int]:
     return [int(match) for match in re.findall(r"\b\d{5,}\b", query or "")]
@@ -141,6 +185,36 @@ def _collect_signal_hits(text: str, signal_weights: dict[str, int]) -> list[tupl
         if signal in lowered:
             hits.append((signal, weight))
     return hits
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    candidate = match.group(0) if match else cleaned
+    payload = json.loads(candidate)
+    return payload if isinstance(payload, dict) else {"raw": payload}
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(limit - 3, 0)].rstrip() + "..."
+
+
+def _compact_sources_for_prompt(sources: list[dict[str, Any]], *, max_items: int = 5) -> list[dict[str, str]]:
+    compact_sources: list[dict[str, str]] = []
+    for item in sources[:max_items]:
+        compact_sources.append(
+            {
+                "title": _truncate_text(str(item.get("title", "")), 160),
+                "url": _truncate_text(str(item.get("url", "")), 200),
+                "snippet": _truncate_text(str(item.get("snippet", "")), 320),
+            }
+        )
+    return compact_sources
 
 
 def _collect_unique_holidays(art_cinv: int) -> tuple[list[str], list[dict[str, Any]], str | None]:
@@ -320,6 +394,11 @@ def _assess_weather_sensitivity(
     return {
         "classification": classification,
         "recommended": recommended,
+        "schema_version": _WEATHER_DECISION_SCHEMA_VERSION,
+        "decision_source": "heuristic_fallback",
+        "confidence": "medium",
+        "demand_effect": "unclear",
+        "evidence_summary": rationale,
         "score": score,
         "product_score": product_score,
         "evidence_score": generic_evidence_score,
@@ -327,8 +406,167 @@ def _assess_weather_sensitivity(
         "staple_score": staple_score,
         "matched_signals": matched_signals,
         "blocking_signals": [signal for signal, _ in staple_hits[:6]],
+        "supporting_evidence": matched_signals[:4],
         "rationale": rationale,
     }
+
+
+def _normalize_llm_weather_sensitivity(payload: dict[str, Any]) -> dict[str, Any]:
+    required_fields = {
+        "schema_version",
+        "classification",
+        "recommended",
+        "confidence",
+        "demand_effect",
+        "evidence_summary",
+        "rationale",
+        "matched_signals",
+        "blocking_signals",
+        "supporting_evidence",
+    }
+    missing_fields = sorted(required_fields.difference(payload))
+    if missing_fields:
+        raise ValueError(f"Weather decision payload is missing required fields: {', '.join(missing_fields)}")
+
+    schema_version = str(payload["schema_version"] or "").strip()
+    if schema_version != _WEATHER_DECISION_SCHEMA_VERSION:
+        raise ValueError(f"Unexpected weather decision schema version: {schema_version or '<empty>'}")
+
+    classification = str(payload["classification"] or "").strip().lower()
+    if classification not in _WEATHER_CLASSIFICATIONS:
+        raise ValueError(f"Invalid weather decision classification: {classification or '<empty>'}")
+
+    recommended = payload["recommended"]
+    if not isinstance(recommended, bool):
+        raise ValueError("Weather decision recommended field must be a boolean")
+
+    confidence = str(payload["confidence"] or "").strip().lower()
+    if confidence not in _WEATHER_CONFIDENCE_LEVELS:
+        raise ValueError(f"Invalid weather decision confidence: {confidence or '<empty>'}")
+
+    demand_effect = str(payload["demand_effect"] or "").strip().lower()
+    if demand_effect not in _WEATHER_DEMAND_EFFECTS:
+        raise ValueError(f"Invalid weather decision demand_effect: {demand_effect or '<empty>'}")
+
+    evidence_summary = str(payload["evidence_summary"] or "").strip()
+    if not evidence_summary:
+        raise ValueError("Weather decision evidence_summary must be a non-empty string")
+
+    rationale = str(payload["rationale"] or "").strip()
+    if not rationale:
+        raise ValueError("Weather decision rationale must be a non-empty string")
+
+    def _normalize_string_list(field_name: str) -> list[str]:
+        raw_value = payload[field_name]
+        if not isinstance(raw_value, list):
+            raise ValueError(f"Weather decision {field_name} must be an array")
+        normalized_items: list[str] = []
+        for item in raw_value:
+            if not isinstance(item, str):
+                raise ValueError(f"Weather decision {field_name} must contain strings only")
+            normalized_item = item.strip()
+            if normalized_item:
+                normalized_items.append(normalized_item)
+        return normalized_items[:6]
+
+    matched_signals = _normalize_string_list("matched_signals")
+    blocking_signals = _normalize_string_list("blocking_signals")
+    supporting_evidence = _normalize_string_list("supporting_evidence")
+
+    if recommended and classification != "likely":
+        raise ValueError("Weather decision recommended=true requires classification='likely'")
+    if classification in {"possible", "unlikely"} and recommended:
+        raise ValueError("Weather decision classification='possible' or 'unlikely' cannot recommend enrichment")
+    if recommended and confidence == "low":
+        raise ValueError("Weather decision recommended=true requires medium or high confidence")
+    if recommended and demand_effect in {"none", "unclear"}:
+        raise ValueError("Weather decision recommended=true requires a concrete demand_effect")
+    if recommended and not supporting_evidence:
+        raise ValueError("Weather decision recommended=true requires supporting_evidence entries")
+
+    return {
+        "classification": classification,
+        "recommended": recommended,
+        "schema_version": schema_version,
+        "decision_source": "llm",
+        "confidence": confidence,
+        "demand_effect": demand_effect,
+        "evidence_summary": evidence_summary,
+        "score": None,
+        "product_score": None,
+        "evidence_score": None,
+        "demand_driver_score": None,
+        "staple_score": None,
+        "matched_signals": matched_signals,
+        "blocking_signals": blocking_signals,
+        "supporting_evidence": supporting_evidence,
+        "rationale": rationale,
+    }
+
+
+async def _assess_weather_sensitivity_llm(
+    original_query: str,
+    rewrite_info: dict[str, Any],
+    answer: str,
+    sources: list[dict[str, Any]],
+) -> dict[str, Any]:
+    client = get_responses_client()
+    agent = client.as_agent(
+        name="WeatherSensitivityDecision",
+        instructions=_WEATHER_DECISION_SYSTEM_PROMPT,
+        tools=[],
+    )
+
+    prompt = dedent(
+        f"""
+        Decide whether weather enrichment is warranted for this article.
+
+        ARTICLE_CONTEXT:
+        {json.dumps({
+            "original_query": _truncate_text(original_query, 200),
+            "article_name": rewrite_info.get("article_name", ""),
+            "category_text": rewrite_info.get("category_text", ""),
+            "rewritten_from_cinv": bool(rewrite_info.get("rewritten_from_cinv")),
+            "source_cinv": rewrite_info.get("source_cinv"),
+        }, ensure_ascii=True)}
+
+        SEARCH_EVIDENCE:
+        {json.dumps({
+            "answer_excerpt": _truncate_text(answer, 1200),
+            "sources": _compact_sources_for_prompt(sources),
+        }, ensure_ascii=True)}
+        """
+    ).strip()
+
+    chunks: list[str] = []
+    stream = agent.run(prompt, stream=True)
+    async for update in stream:
+        if not isinstance(update, AgentResponseUpdate):
+            continue
+        for content in update.contents:
+            if getattr(content, "type", None) != "text":
+                continue
+            chunk = getattr(content, "text", "") or ""
+            if chunk:
+                chunks.append(chunk)
+
+    final_response = await stream.get_final_response()
+    final_text = getattr(final_response, "text", None) or "".join(chunks)
+    return _normalize_llm_weather_sensitivity(_extract_json_object(final_text))
+
+
+def _decide_weather_sensitivity(
+    original_query: str,
+    rewrite_info: dict[str, Any],
+    answer: str,
+    sources: list[dict[str, Any]],
+) -> dict[str, Any]:
+    try:
+        return asyncio.run(_assess_weather_sensitivity_llm(original_query, rewrite_info, answer, sources))
+    except Exception as exc:
+        fallback = _assess_weather_sensitivity(original_query, rewrite_info, answer, sources)
+        fallback["llm_error"] = str(exc)
+        return fallback
 
 
 @lru_cache(maxsize=128)
@@ -376,7 +614,7 @@ def _normalize_search_query(query: str) -> tuple[str, dict[str, Any]]:
 def search_article_characteristics(query: str) -> str:
     """Search the web for demand drivers, seasonality, and supply-chain characteristics for an article."""
     normalized_query, rewrite_info = _normalize_search_query(query)
-    weather_sensitivity = _assess_weather_sensitivity(query, rewrite_info, "", [])
+    weather_sensitivity = _decide_weather_sensitivity(query, rewrite_info, "", [])
 
     if not config.TAVILY_API_KEY:
         return json.dumps(
@@ -412,7 +650,7 @@ def search_article_characteristics(query: str) -> str:
     assert result is not None
     sources = _extract_sources(result, max_results=5)
 
-    weather_sensitivity = _assess_weather_sensitivity(query, rewrite_info, result.get("answer", "") or "", sources)
+    weather_sensitivity = _decide_weather_sensitivity(query, rewrite_info, result.get("answer", "") or "", sources)
 
     return json.dumps(
         {
