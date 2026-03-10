@@ -130,6 +130,18 @@ def _apply_tool_payload(state: dict[str, Any], tool_payloads: dict[str, Any], to
             z_score = item.get("z_score")
             if z_score is not None and abs(float(z_score)) > 2:
                 reasons.append(f"z-score {z_score}")
+            modified_z = item.get("modified_z_score")
+            if item.get("modified_z_outlier") and modified_z is not None:
+                reasons.append(f"robust z-score {modified_z}")
+            rolling_ratio = item.get("rolling_median_ratio")
+            if item.get("rolling_baseline_outlier") and rolling_ratio is not None:
+                reasons.append(f"vs recent baseline {float(rolling_ratio):.2f}x")
+            historical_ratio = item.get("historical_ratio")
+            if item.get("historical_baseline_outlier") and historical_ratio is not None:
+                reasons.append(f"vs NM baseline {float(historical_ratio):.2f}x")
+            severity = str(item.get("severity") or "").strip().upper()
+            if severity in {"HIGH", "SEVERE"}:
+                reasons.append(f"{severity.lower()} volatility")
             if item.get("has_promo"):
                 reasons.append("promo week")
             if item.get("has_holiday"):
@@ -343,6 +355,7 @@ class ForecastAnalysisAgent:
                 yield text_message_end(active_message_id)
 
             report_markdown, email_text = _split_deliverables(final_text)
+            report_markdown = _ensure_volatility_guidance_in_report(report_markdown, state)
             report_markdown = _ensure_stockout_guidance_in_report(report_markdown, state)
             email_text = _ensure_stockout_guidance_in_email(email_text, state)
             rendered_email, email_subject = _render_email(cinv, state, email_text)
@@ -470,11 +483,22 @@ def _sentence_case_label(value: str) -> str:
 def _build_email_summary_line(state: dict[str, Any]) -> str:
     article_name = state.get("article_name") or f"CINV {state.get('cinv', 'unknown')}"
     forecast_health = _load_json_object(state.get("forecast_health") or {})
+    outlier_analysis = _load_json_object(state.get("outlier_analysis") or {})
+    volatility_summary = _load_json_object(outlier_analysis.get("summary") or {})
     year_on_year = _load_json_object(state.get("year_on_year") or {})
     yoy_summary = _load_json_object(year_on_year.get("summary") or {})
     stockout_risk = _load_json_object(state.get("stockout_risk") or {})
 
     fragments = [f"We completed a review of the forecast for {article_name}."]
+
+    volatility_level = str(volatility_summary.get("volatility_level") or "").strip().upper()
+    outlier_count = outlier_analysis.get("count")
+    cv = volatility_summary.get("coefficient_of_variation")
+    if volatility_level == "HIGH" and outlier_count:
+        detail = f"Shipments are highly volatile, with {int(outlier_count)} flagged outlier weeks"
+        if cv is not None:
+            detail += f" and a coefficient of variation of {float(cv) * 100:.1f}%"
+        fragments.append(detail + ".")
 
     trend_direction = str(yoy_summary.get("trend_direction") or "").strip().upper()
     avg_yoy_vs_nm1 = yoy_summary.get("avg_yoy_vs_nm1_pct")
@@ -504,6 +528,8 @@ def _build_email_observation_lines(state: dict[str, Any]) -> list[str]:
     latest_streak = _load_json_object(stockout_risk.get("latest_zero_shipment_streak") or {})
     forecast_health = _load_json_object(state.get("forecast_health") or {})
     outlier_analysis = _load_json_object(state.get("outlier_analysis") or {})
+    volatility_summary = _load_json_object(outlier_analysis.get("summary") or {})
+    volatile_periods = outlier_analysis.get("volatile_periods") or []
     year_on_year = _load_json_object(state.get("year_on_year") or {})
     yoy_summary = _load_json_object(year_on_year.get("summary") or {})
     weather_analysis = _load_json_object(state.get("weather_analysis") or {})
@@ -523,6 +549,28 @@ def _build_email_observation_lines(state: dict[str, Any]) -> list[str]:
         observations.append(detail + ".")
 
     outliers = outlier_analysis.get("outliers") or []
+    if str(volatility_summary.get("volatility_level") or "").upper() == "HIGH":
+        high_count = volatility_summary.get("high_outlier_count")
+        low_count = volatility_summary.get("low_outlier_count")
+        median_change = volatility_summary.get("median_abs_weekly_change_pct")
+        detail = "The shipment profile is structurally volatile"
+        if high_count is not None and low_count is not None:
+            detail += f", with {int(high_count)} high spikes and {int(low_count)} low anomalies"
+        if median_change is not None:
+            detail += f" and a median week-on-week change of {float(median_change):.1f}%"
+        observations.append(detail + ".")
+
+    if volatile_periods:
+        primary_period = volatile_periods[0]
+        start_week = str(primary_period.get("start_week_id") or "").strip()
+        end_week = str(primary_period.get("end_week_id") or "").strip()
+        outlier_count = primary_period.get("outlier_count")
+        dominant_pattern = str(primary_period.get("dominant_pattern") or "").strip()
+        if start_week and end_week and outlier_count:
+            observations.append(
+                f"The main volatile period ran from {start_week} to {end_week}, with {int(outlier_count)} flagged weeks driven by {dominant_pattern}."
+            )
+
     if outliers:
         top_outliers = outliers[:2]
         formatted = []
@@ -559,6 +607,8 @@ def _build_email_action_lines(state: dict[str, Any]) -> list[str]:
     actions: list[str] = []
     stockout_risk = _load_json_object(state.get("stockout_risk") or {})
     forecast_health = _load_json_object(state.get("forecast_health") or {})
+    outlier_analysis = _load_json_object(state.get("outlier_analysis") or {})
+    volatility_summary = _load_json_object(outlier_analysis.get("summary") or {})
     flagged_weeks = state.get("flagged_weeks") or []
     latest_streak = _load_json_object(stockout_risk.get("latest_zero_shipment_streak") or {})
     affected_period = str(stockout_risk.get("affected_period") or "").strip()
@@ -583,6 +633,9 @@ def _build_email_action_lines(state: dict[str, Any]) -> list[str]:
 
     if flagged_weeks:
         actions.append("Flag the most anomalous weeks for model exclusion so they do not distort future learning.")
+
+    if str(volatility_summary.get("volatility_level") or "").upper() == "HIGH":
+        actions.append("Review whether recurring spikes reflect missing event, promotion, or customer-order signals in the baseline model.")
 
     if forecast_health.get("tracking_signal_flag"):
         actions.append("Review model bias and tracking signal before the next forecast refresh.")
@@ -700,6 +753,75 @@ def _ensure_stockout_guidance_in_email(email_text: str, state: dict[str, Any]) -
     else:
         updated_body = f"{email_body}\n\n{stockout_sentence}"
     return _compose_email_text(subject, updated_body)
+
+
+def _build_volatility_report_block(state: dict[str, Any]) -> str:
+    outlier_analysis = _load_json_object(state.get("outlier_analysis") or {})
+    summary = _load_json_object(outlier_analysis.get("summary") or {})
+    outliers = outlier_analysis.get("outliers") or []
+    volatile_periods = outlier_analysis.get("volatile_periods") or []
+    if not summary and not outliers:
+        return ""
+
+    lines: list[str] = []
+    weeks_evaluated = summary.get("weeks_evaluated")
+    outlier_count = outlier_analysis.get("count")
+    volatility_level = str(summary.get("volatility_level") or "").strip().upper()
+    cv = summary.get("coefficient_of_variation")
+    median_change = summary.get("median_abs_weekly_change_pct")
+    if weeks_evaluated and outlier_count is not None:
+        headline = f"- Volatility assessment: {volatility_level.lower() if volatility_level else 'unclassified'} across {int(weeks_evaluated)} positive-demand weeks, with {int(outlier_count)} flagged outliers"
+        if cv is not None:
+            headline += f" and coefficient of variation at {float(cv) * 100:.1f}%"
+        if median_change is not None:
+            headline += f"; median week-on-week change was {float(median_change):.1f}%"
+        lines.append(headline + ".")
+
+    high_count = summary.get("high_outlier_count")
+    low_count = summary.get("low_outlier_count")
+    peak_week = summary.get("peak_spike_week_id")
+    peak_units = summary.get("peak_spike_units")
+    if high_count is not None and low_count is not None:
+        composition = f"- Composition: {int(high_count)} high-demand spikes and {int(low_count)} low-demand troughs were detected"
+        if peak_week and peak_units is not None:
+            composition += f"; the largest spike was {peak_week} at {peak_units} units"
+        lines.append(composition + ".")
+
+    if volatile_periods:
+        period_fragments = []
+        for period in volatile_periods[:2]:
+            start_week = str(period.get("start_week_id") or "").strip()
+            end_week = str(period.get("end_week_id") or "").strip()
+            count = period.get("outlier_count")
+            pattern = str(period.get("dominant_pattern") or "").strip()
+            if start_week and end_week and count:
+                period_fragments.append(f"{start_week} to {end_week} ({int(count)} flagged weeks, {pattern})")
+        if period_fragments:
+            lines.append(f"- Volatile periods: {'; '.join(period_fragments)}.")
+
+    if outliers:
+        examples = []
+        for item in outliers[:3]:
+            week_id = str(item.get("week_id") or "").strip()
+            actual = item.get("ACTUAL_DEMAND")
+            ratio = item.get("historical_ratio")
+            if week_id and actual is not None:
+                example = f"{week_id} ({actual} units"
+                if ratio is not None:
+                    example += f", {float(ratio):.2f}x the NM baseline"
+                example += ")"
+                examples.append(example)
+        if examples:
+            lines.append(f"- Representative flagged weeks: {', '.join(examples)}.")
+
+    return "\n".join(lines)
+
+
+def _ensure_volatility_guidance_in_report(report_markdown: str, state: dict[str, Any]) -> str:
+    block = _build_volatility_report_block(state)
+    if not block:
+        return report_markdown
+    return _insert_after_section(report_markdown, "Demand Volatility & Outlier Analysis", block)
 
 
 def _render_report(cinv: int, state: dict[str, Any], report_markdown: str) -> str:

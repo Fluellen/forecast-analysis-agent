@@ -51,6 +51,8 @@ SYSTEM_PROMPT = dedent(
       Call detect_pre_pivot_stockout_risk to identify consecutive zero-shipment weeks before the pivot
       that may have artificially depressed the forecast baseline.
       Call detect_outlier_weeks to identify anomalous periods.
+      Use the returned `summary`, `volatile_periods`, and `outlier_methods` fields to distinguish
+      between isolated one-off anomalies and a structurally volatile shipment pattern with recurring spikes.
 
     STEP 4 — YEAR-ON-YEAR TREND ANALYSIS
       Call analyse_year_on_year_trend to compare current demand against NM1/NM2/NM3.
@@ -91,6 +93,7 @@ SYSTEM_PROMPT = dedent(
       - Avoid filler such as "I hope this message finds you well" or "Thank you for your attention"
       - Use this structure exactly: one short summary paragraph, a `Key observations` block, a `Recommended actions` block, and one short closing sentence requesting client context
       - Mention the specific weeks where disruptions were observed
+      - If the outlier tool reports `volatility_level = HIGH`, explicitly state that shipments are volatile and mention the recurring spike period(s), not just individual weeks
       - Reference weather or year-on-year anomalies only when supported by tool output
       - Explain what action DFAI will take, including outlier exclusion and any xout or article-link remediation when relevant
       - Do not repeat the same fact in multiple sections
@@ -112,6 +115,8 @@ SYSTEM_PROMPT = dedent(
       - In `## Linked Article & Substitution Context`, call out duplicate linked-article
         rows explicitly when present and explain that they may overstate substitution
         evidence or indicate a data issue that coincides with changing demand behaviour.
+      - In `## Demand Volatility & Outlier Analysis`, quantify volatility using the outlier tool summary when available.
+        If the series is highly volatile, say so explicitly and cite both the outlier count and the main volatile period.
       - If you skip STEP 5, state clearly in `## Weather Impact Analysis` that the
         search evidence did not indicate material weather sensitivity.
       - Do not invent data. Only state what the tools have returned.

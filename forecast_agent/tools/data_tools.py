@@ -22,6 +22,13 @@ def _json(data: dict[str, Any]) -> str:
     return json.dumps(data, default=str)
 
 
+def _clean_label(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"", "none", "nan", "null"} else text
+
+
 FORECAST_EXPORT_COLUMNS = [
     "ART_CINV",
     "PIVOT_DATE",
@@ -490,32 +497,161 @@ def compute_forecast_health(art_cinv: int) -> str:
 
 
 def detect_outlier_weeks(art_cinv: int) -> str:
-    """Detect statistically unusual demand weeks for an article using IQR and z-score methods."""
+    """Detect statistically unusual demand weeks for an article.
+
+    The baseline keeps the historical IQR and z-score rules for compatibility, then
+    adds more robust signals for genuinely volatile series where repeated spikes can
+    inflate the global variance and hide structurally anomalous weeks.
+    """
     frame = get_article_forecast_frame(int(art_cinv)).copy()
-    clean = frame[frame["ACTUAL_DEMAND"] > 0].copy()
+    clean = frame[frame["ACTUAL_DEMAND"] > 0].sort_values("MVT_DATE_DT").copy()
 
     if clean.empty:
-        return _json({"art_cinv": int(art_cinv), "count": 0, "outliers": []})
+        return _json(
+            {
+                "art_cinv": int(art_cinv),
+                "count": 0,
+                "outliers": [],
+                "summary": {
+                    "weeks_evaluated": 0,
+                    "volatility_level": "INSUFFICIENT_DATA",
+                },
+                "volatile_periods": [],
+            }
+        )
 
-    q1 = clean["ACTUAL_DEMAND"].quantile(0.25)
-    q3 = clean["ACTUAL_DEMAND"].quantile(0.75)
+    actual = clean["ACTUAL_DEMAND"].astype(float)
+    q1 = actual.quantile(0.25)
+    q3 = actual.quantile(0.75)
     iqr = q3 - q1
     lower = q1 - 1.5 * iqr
     upper = q3 + 1.5 * iqr
 
-    std = clean["ACTUAL_DEMAND"].std(ddof=0)
-    mean = clean["ACTUAL_DEMAND"].mean()
+    std = float(actual.std(ddof=0)) if len(actual) > 1 else 0.0
+    mean = float(actual.mean())
+    median = float(actual.median())
+    cv = float(std / mean) if mean and not np.isclose(mean, 0.0) else 0.0
+    abs_pct_change = actual.pct_change().abs().replace([np.inf, -np.inf], np.nan)
+    median_abs_pct_change = float(abs_pct_change.dropna().median()) if abs_pct_change.notna().any() else 0.0
+
     if std and not np.isclose(std, 0):
-        clean["z_score"] = stats.zscore(clean["ACTUAL_DEMAND"], nan_policy="omit")
+        clean["z_score"] = stats.zscore(actual, nan_policy="omit")
     else:
         clean["z_score"] = 0.0
 
-    clean["iqr_outlier"] = (clean["ACTUAL_DEMAND"] < lower) | (clean["ACTUAL_DEMAND"] > upper)
+    mad = float((actual - median).abs().median()) if len(actual) > 1 else 0.0
+    if mad and not np.isclose(mad, 0.0):
+        clean["modified_z_score"] = 0.6745 * (actual - median) / mad
+    else:
+        clean["modified_z_score"] = 0.0
+
+    clean["rolling_median_baseline"] = actual.rolling(6, min_periods=4).median().shift(1)
+    clean["rolling_median_ratio"] = np.where(
+        clean["rolling_median_baseline"].notna() & ~np.isclose(clean["rolling_median_baseline"], 0.0),
+        actual / clean["rolling_median_baseline"],
+        np.nan,
+    )
+
+    historical_baseline = clean[["NM1", "NM2", "NM3"]].replace(0, np.nan).mean(axis=1)
+    clean["historical_baseline"] = historical_baseline
+    clean["historical_ratio"] = np.where(
+        historical_baseline.notna() & ~np.isclose(historical_baseline, 0.0),
+        actual / historical_baseline,
+        np.nan,
+    )
+
+    clean["iqr_outlier"] = (actual < lower) | (actual > upper)
     clean["z_outlier"] = clean["z_score"].abs() > 2
-    outliers = clean[clean["iqr_outlier"] | clean["z_outlier"]].copy()
+    clean["modified_z_outlier"] = clean["modified_z_score"].abs() > 3.5
+
+    high_volatility_series = cv >= 0.4 or median_abs_pct_change >= 0.45
+    clean["rolling_baseline_outlier"] = (
+        clean["rolling_median_ratio"].notna()
+        & ((clean["rolling_median_ratio"] >= 1.9) | (clean["rolling_median_ratio"] <= 0.53))
+        & clean["modified_z_outlier"]
+    )
+    clean["historical_baseline_outlier"] = (
+        clean["historical_ratio"].notna()
+        & ((clean["historical_ratio"] >= 1.9) | (clean["historical_ratio"] <= 0.53))
+        & clean["modified_z_outlier"]
+    )
+    clean["enhanced_outlier"] = bool(high_volatility_series) & (
+        clean["rolling_baseline_outlier"] | clean["historical_baseline_outlier"]
+    )
+
+    recovery_suppressed_count = 0
+    recovery_context = json.loads(detect_pre_pivot_stockout_risk(int(art_cinv)))
+    latest_zero_streak = recovery_context.get("latest_zero_shipment_streak") or {}
+    recovery_baseline_raw = recovery_context.get("xout_replacement_units")
+    recovery_baseline = None
+    try:
+        recovery_baseline = float(recovery_baseline_raw) if recovery_baseline_raw is not None else None
+    except (TypeError, ValueError):
+        recovery_baseline = None
+
+    recovery_mask = pd.Series(False, index=clean.index)
+    zero_streak_end = pd.to_datetime(latest_zero_streak.get("end_date"), errors="coerce")
+    if pd.notna(zero_streak_end) and recovery_baseline and not np.isclose(recovery_baseline, 0.0):
+        recovery_window_end = zero_streak_end + pd.Timedelta(days=42)
+        recovery_mask = (
+            clean["MVT_DATE_DT"].gt(zero_streak_end)
+            & clean["MVT_DATE_DT"].le(recovery_window_end)
+            & actual.ge(recovery_baseline * 0.9)
+            & actual.le(recovery_baseline * 1.15)
+            & actual.lt(mean)
+            & ~clean["rolling_baseline_outlier"]
+            & ~clean["historical_baseline_outlier"]
+        )
+
+    outliers = clean[
+        clean["iqr_outlier"]
+        | clean["z_outlier"]
+        | clean["enhanced_outlier"]
+    ].copy()
+    if recovery_mask.any():
+        recovery_suppressed_count = int(outliers.index.isin(clean.index[recovery_mask]).sum())
+        if recovery_suppressed_count:
+            outliers = outliers.loc[~outliers.index.isin(clean.index[recovery_mask])].copy()
+
+    detection_notes = [
+        "Base detection uses global IQR fences and z-score thresholds for backward compatibility.",
+    ]
+    if high_volatility_series:
+        detection_notes.append(
+            "High-volatility enhancement activated because repeated spikes widened the global distribution. "
+            "Robust median/MAD, recent rolling-baseline ratios, and same-week NM history are used to recover concealed spikes."
+        )
+    if recovery_suppressed_count:
+        detection_notes.append(
+            f"Suppressed {recovery_suppressed_count} low-demand recovery week(s) immediately after the latest zero-shipment streak because demand had already returned close to the xout recovery baseline."
+        )
+
+    def _outlier_methods(row: Any) -> list[str]:
+        methods: list[str] = []
+        if bool(row.iqr_outlier):
+            methods.append("iqr")
+        if bool(row.z_outlier):
+            methods.append("z_score")
+        if bool(row.modified_z_outlier):
+            methods.append("modified_z_score")
+        if bool(row.rolling_baseline_outlier):
+            methods.append("recent_baseline")
+        if bool(row.historical_baseline_outlier):
+            methods.append("historical_baseline")
+        return methods
+
+    def _severity(methods: list[str], modified_z_score: float) -> str:
+        if len(methods) >= 3 or abs(modified_z_score) >= 6:
+            return "SEVERE"
+        if len(methods) >= 2 or abs(modified_z_score) >= 4:
+            return "HIGH"
+        return "MODERATE"
 
     records: list[dict[str, Any]] = []
-    for row in outliers.sort_values("z_score", key=lambda column: column.abs(), ascending=False).itertuples():
+    for row in outliers.sort_values("modified_z_score", key=lambda column: column.abs(), ascending=False).itertuples():
+        holiday_name = _clean_label(row.HOLIDAYS_TYPE)
+        promo_name = _clean_label(row.PROMO_TYPE)
+        methods = _outlier_methods(row)
         records.append(
             {
                 "week_id": row.WEEK_ID,
@@ -524,17 +660,91 @@ def detect_outlier_weeks(art_cinv: int) -> str:
                 "FORECAST": normalize_for_json(row.FORECAST),
                 "direction": "HIGH" if float(row.ACTUAL_DEMAND) >= mean else "LOW",
                 "z_score": round(float(row.z_score), 3),
+                "modified_z_score": round(float(row.modified_z_score), 3),
                 "iqr_outlier": bool(row.iqr_outlier),
-                "has_promo": bool(str(row.PROMO_TYPE).strip()),
-                "has_holiday": bool(str(row.HOLIDAYS_TYPE).strip()),
-                "holiday_name": str(row.HOLIDAYS_TYPE).strip(),
+                "z_outlier": bool(row.z_outlier),
+                "modified_z_outlier": bool(row.modified_z_outlier),
+                "rolling_median_ratio": round(float(row.rolling_median_ratio), 3) if pd.notna(row.rolling_median_ratio) else None,
+                "rolling_baseline_outlier": bool(row.rolling_baseline_outlier),
+                "historical_ratio": round(float(row.historical_ratio), 3) if pd.notna(row.historical_ratio) else None,
+                "historical_baseline_outlier": bool(row.historical_baseline_outlier),
+                "outlier_methods": methods,
+                "severity": _severity(methods, float(row.modified_z_score)),
+                "has_promo": bool(promo_name),
+                "promo_name": promo_name,
+                "has_holiday": bool(holiday_name),
+                "holiday_name": holiday_name,
             }
         )
+
+    high_outliers = [item for item in records if item.get("direction") == "HIGH"]
+    low_outliers = [item for item in records if item.get("direction") == "LOW"]
+    max_spike = max(high_outliers, key=lambda item: float(item.get("ACTUAL_DEMAND") or 0), default=None)
+
+    grouped_periods: list[list[dict[str, Any]]] = []
+    for item in sorted(records, key=lambda candidate: str(candidate.get("MVT_DATE") or "")):
+        if not grouped_periods:
+            grouped_periods.append([item])
+            continue
+        previous = grouped_periods[-1][-1]
+        previous_ts = pd.to_datetime(previous.get("MVT_DATE"), errors="coerce")
+        current_ts = pd.to_datetime(item.get("MVT_DATE"), errors="coerce")
+        if pd.notna(previous_ts) and pd.notna(current_ts) and (current_ts - previous_ts).days <= 35:
+            grouped_periods[-1].append(item)
+        else:
+            grouped_periods.append([item])
+
+    volatile_periods: list[dict[str, Any]] = []
+    for group in grouped_periods:
+        if not group:
+            continue
+        high_count = sum(1 for item in group if item.get("direction") == "HIGH")
+        low_count = len(group) - high_count
+        dominant_pattern = "repeating spikes" if high_count > low_count else "repeating troughs" if low_count > high_count else "mixed volatility"
+        volatile_periods.append(
+            {
+                "start_week_id": group[0].get("week_id"),
+                "end_week_id": group[-1].get("week_id"),
+                "start_date": group[0].get("MVT_DATE"),
+                "end_date": group[-1].get("MVT_DATE"),
+                "outlier_count": len(group),
+                "high_outlier_count": high_count,
+                "low_outlier_count": low_count,
+                "dominant_pattern": dominant_pattern,
+                "representative_weeks": [item.get("week_id") for item in group[:4] if item.get("week_id")],
+            }
+        )
+
+    if len(records) >= max(8, int(len(clean) * 0.18)) or (cv >= 0.4 and len(records) >= max(4, int(len(clean) * 0.05))):
+        volatility_level = "HIGH"
+    elif cv >= 0.25 or len(records) >= max(5, int(len(clean) * 0.1)):
+        volatility_level = "MODERATE"
+    else:
+        volatility_level = "LOW"
+
+    summary = {
+        "weeks_evaluated": int(len(clean)),
+        "outlier_share_pct": round(float(len(records) / len(clean) * 100), 2),
+        "high_outlier_count": int(len(high_outliers)),
+        "low_outlier_count": int(len(low_outliers)),
+        "mean_demand": round(mean, 2),
+        "median_demand": round(median, 2),
+        "std_demand": round(std, 2),
+        "coefficient_of_variation": round(cv, 3),
+        "median_abs_weekly_change_pct": round(median_abs_pct_change * 100, 2),
+        "volatility_level": volatility_level,
+        "high_volatility_series": bool(high_volatility_series),
+        "peak_spike_week_id": max_spike.get("week_id") if max_spike else None,
+        "peak_spike_units": max_spike.get("ACTUAL_DEMAND") if max_spike else None,
+    }
 
     return _json(
         {
             "art_cinv": int(art_cinv),
             "count": len(records),
             "outliers": records,
+            "summary": summary,
+            "volatile_periods": volatile_periods,
+            "detection_notes": detection_notes,
         }
     )
